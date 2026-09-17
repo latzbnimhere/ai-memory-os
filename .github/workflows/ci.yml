@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: macOS / Python ${{ matrix.python-version }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Public tree audit
+        run: python3 tools/public_audit.py
+
+      - name: Unit tests in isolated runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_HOME="$RUNNER_TEMP/unit-home-${{ matrix.python-version }}"
+          TEST_ROOT="$RUNNER_TEMP/unit-memory-${{ matrix.python-version }}"
+          mkdir -p "$TEST_HOME" "$TEST_ROOT"
+          HOME="$TEST_HOME" \
+          AI_MEMORY_ROOT="$TEST_ROOT" \
+          PYTHONPATH="$GITHUB_WORKSPACE/lib" \
+          python3 -m unittest discover -s tests -v
+
+      - name: Full isolated selftest
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_HOME="$RUNNER_TEMP/selftest-home-${{ matrix.python-version }}"
+          TEST_ROOT="$RUNNER_TEMP/selftest-memory-${{ matrix.python-version }}"
+          mkdir -p "$TEST_HOME" "$TEST_ROOT"
+          HOME="$TEST_HOME" \
+          AI_MEMORY_ROOT="$TEST_ROOT" \
+          PYTHONPATH="$GITHUB_WORKSPACE/lib" \
+          python3 bin/aimem selftest --full
+
+      - name: Fresh install verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/AI-Memory-${{ matrix.python-version }}"
+          python3 tools/install.py --root "$ROOT"
+          AI_MEMORY_ROOT="$ROOT" python3 "$ROOT/bin/aimem" version
+          AI_MEMORY_ROOT="$ROOT" python3 "$ROOT/bin/aimem" doctor --deep --no-repo

@@ -11,6 +11,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 
 from . import backup, core, health, recover, sessions
 from .core import RUN, config, project_dir
@@ -133,8 +134,21 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class LocalThreadingHTTPServer(ThreadingHTTPServer):
+    """HTTP server that binds locally without reverse-DNS lookup at startup."""
+
+    def server_bind(self):
+        # HTTPServer.server_bind() calls socket.getfqdn(host), which can block on
+        # reverse DNS even for 127.0.0.1 in restricted/CI environments. Bind via
+        # TCPServer directly, then set the two HTTPServer metadata attributes.
+        TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
 def serve(port):
-    srv = ThreadingHTTPServer((HOST, port), Handler)
+    srv = LocalThreadingHTTPServer((HOST, port), Handler)
     RUN.mkdir(exist_ok=True)
     core.atomic_write_json(pid_file(), {"pid": os.getpid(), "host": HOST, "port": port, "started": core.iso()})
     try:
