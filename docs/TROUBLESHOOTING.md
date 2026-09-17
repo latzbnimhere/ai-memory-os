@@ -1,0 +1,12 @@
+# Troubleshooting
+- `AMBIGUOUS_OPEN_SESSIONS` (exit 6): pass `--session <id>`; list with `aimem sessions <slug> --open`.
+- `VERSION_CONFLICT` / `CANONICAL_STATE_ADVANCED_BY_ANOTHER_SESSION` (exit 3): re-read CURRENT/NEXT, merge, retry with `--expect-version N`.
+- `LOCK_TIMEOUT` (exit 5): another agent is writing the same project; retry. Raise `lock_timeout_s` in config if needed.
+- `RECOVERY_REQUIRED` (exit 4): `aimem recover <slug>`, read the packet, close the dead session, continue in a new one.
+- `unresolved transaction`: `aimem txn <slug>` then `aimem txn <slug> --repair`.
+- `memory.db ... UNREADABLE`: derived index; `aimem doctor --repair` or `aimem reindex` (corrupt file is quarantined, not deleted).
+- `CURRENT.md did not change`: update it, or use `--allow-unchanged` for a read-only phase.
+- `RECURSIVE_INDEX_RISK`: never register `~/AI-Memory` or a parent of it.
+- Context too large: keep CURRENT.md compact; move detail to knowledge/ or checkpoints; `aimem health` warns above ~9k tokens.
+- Dashboard will not start: see `~/AI-Memory/.run/dashboard.log`; port busy -> `--port`.
+- Rollback to V3.1.1: see ROLLBACK.md.

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Private AI Memory runtime state
+projects/
+sessions/
+checkpoints/
+artifacts/
+logs/
+objects/
+.locks/
+.run/
+.txn/
+.previous/
+.generated/
+.handoff/
+backups/
+
+# Secrets / local configuration
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local publication safety marker
+.DO_NOT_PUBLISH

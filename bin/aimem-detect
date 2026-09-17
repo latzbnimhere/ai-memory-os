@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""AI Memory OS V4 launcher: aimem-detect (thin wrapper over lib/aimem)."""
+import sys
+from pathlib import Path
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent / "lib"))
+from aimem.detect import main
+if __name__ == "__main__":
+    main()
