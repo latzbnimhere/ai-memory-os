@@ -5,7 +5,7 @@
 ├── bin/aimem, aimem-step, aimem-detect, aimem-sweep      thin launchers -> lib/aimem
 ├── lib/aimem/                                          engine (stdlib only)
 │   core.py  txn.py  sessions.py  reconcile.py  provenance.py  index.py  context.py  compact.py
-│   objects.py  chat.py  recover.py  health.py  dashboard.py  backup.py  doctor.py  migrate.py  integrate.py  selftest.py
+│   objects.py  chat.py  recover.py  health.py  dashboard.py  backup.py  doctor.py  migrate.py  integrate.py  hooks.py  selftest.py
 ├── registry/projects.json (canonical)  registry/memory.db (derived FTS5, rebuildable, quarantined if corrupt)
 ├── objects/sha256/ab/cd/<hash>                         content-addressed artifacts (read-only, deduplicated)
 ├── projects/<slug>/
@@ -16,7 +16,7 @@
 │   cold/step-journal/<day>.jsonl  cold/physical-journal/  cold/txn-journal/  raw history (never deleted)
 │   cold/summaries/{daily,phase}/ + CHECKPOINTS.md      deterministic compaction layers
 │   knowledge/ (chat-imports/)  artifacts/  .generated/ (disposable packs)  .txn/ (in-flight transactions)
-├── .locks/ (flock files)  .run/ (dashboard pid, sweep state)  logs/
+├── .locks/ (flock files)  .run/ (dashboard pid, sweep state, hooks/claude/ session bindings)  logs/
 └── AI_MEMORY_AGENT_PROTOCOL_V4.md and companion protocol files
 ```
 

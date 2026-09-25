@@ -57,6 +57,8 @@ DEFAULT_CONFIG = {
     "backup_dir": str(Path.home() / "AI-Memory-Backups"),
     "backup_max_age_days": 7,
     "context_size_warning_tokens": 9000,
+    "hook_context_tokens": None,
+    "hook_log_prompts": True,
 }
 
 TEXT_EXTS = {".md", ".txt", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".csv"}

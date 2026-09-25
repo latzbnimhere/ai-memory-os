@@ -10,6 +10,10 @@ SLUG="$(~/AI-Memory/bin/aimem-detect "$PWD" 2>/dev/null || true)"
 Output lines: `SESSION_ID=`, `CONTEXT=`, `APPROX_TOKENS=`, `MEMORY_VERSION=`, `RECONCILIATION=` (+`RECONCILE_CONTEXT=` when
 not MEMORY_MATCH), optional `WARN=` lines. Capture the exact SESSION_ID. Read CONTEXT first. Never load `~/AI-Memory` recursively.
 
+Claude Code with hooks installed (`aimem hooks install`): when your context already contains `AIMEM_HOOKS=ACTIVE`, the
+session is open; do not run `begin`, use the shown `AIMEM_SESSION_ID`. Prompts, file writes, commands and tool errors are
+logged automatically (section 2 becomes optional). Sections 4-8 still apply. See `docs/v4/CLAUDE_CODE_HOOKS.md`.
+
 Reconciliation statuses: MEMORY_MATCH, PHYSICAL_AHEAD, MEMORY_AHEAD_OR_UNVERIFIED, DIVERGED, RUNTIME_VERIFICATION_REQUIRED,
 plus flags DIRTY_REPO / CURRENT_MD_HEAD_MISMATCH. Anything but MEMORY_MATCH means: verify physical state before trusting memory.
 Freshly verified physical state overrides stale memory. CURRENT.md is never rewritten from git alone.

@@ -39,9 +39,20 @@ SLUG="$(~/AI-Memory/bin/aimem-detect "$PWD")"
 ~/AI-Memory/bin/aimem finish "$SLUG" --session "$SESSION_ID" --result PASS --label "checkpoint"
 ```
 
+## Claude Code: automatic
+
+```bash
+~/AI-Memory/bin/aimem hooks install     # merges 7 hooks into ~/.claude/settings.json (backup first; `hooks uninstall` reverses it)
+```
+
+From then on every Claude Code session inside a registered repository opens an AI Memory session, receives the bounded
+context pack, and logs prompts, file writes, commands and tool errors automatically. The agent still owns the closeout
+(`CURRENT.md`, `NEXT.md`, `aimem finish`). Hooks fail open and are silent outside registered projects.
+See [Claude Code hooks](docs/CLAUDE_CODE_HOOKS.md).
+
 ## Docs
 
-[Installation](docs/INSTALL.md) · [Architecture](docs/ARCHITECTURE.md) · [Commands](docs/COMMANDS.md) · [Agent protocol](docs/AGENT_PROTOCOL.md) ·
+[Installation](docs/INSTALL.md) · [Architecture](docs/ARCHITECTURE.md) · [Commands](docs/COMMANDS.md) · [Agent protocol](docs/AGENT_PROTOCOL.md) · [Claude Code hooks](docs/CLAUDE_CODE_HOOKS.md) ·
 [Recovery](docs/RECOVERY.md) · [Backup/restore](docs/BACKUP_RESTORE.md) · [ChatGPT bridge](docs/CHATGPT_BRIDGE.md) ·
 [Dashboard](docs/DASHBOARD.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Migration from V3.1.1](docs/MIGRATION_V3_1_1_TO_V4.md) ·
 [Rollback](docs/ROLLBACK.md) · [Security / no-API policy](docs/SECURITY_NO_API.md) · [Public safety](docs/PUBLIC_SAFETY.md)

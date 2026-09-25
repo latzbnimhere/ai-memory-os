@@ -56,8 +56,16 @@ The slug and display name are examples. Do not store credentials, customer data,
 
 Global instruction integration is intentionally separate from installation. Review the generated instructions and the agent protocol before enabling it.
 
+For Claude Code, the protocol can run automatically through hooks (opt-in, reversible, fails open):
+
+```bash
+~/AI-Memory/bin/aimem hooks install
+~/AI-Memory/bin/aimem hooks status
+```
+
 See:
 
+- `docs/CLAUDE_CODE_HOOKS.md`
 - `docs/AGENT_PROTOCOL.md`
 - `share/OTHER_AI_AGENT_INSTRUCTIONS.md`
 - `docs/SECURITY_NO_API.md`

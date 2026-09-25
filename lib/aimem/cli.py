@@ -524,6 +524,31 @@ def cmd_integrate_global(a):
         print(f"{path}: {r} verified={ok}")
 
 
+def cmd_hooks(a):
+    from . import hooks
+    if a.action == "run":
+        hooks.run_stdin(a.event)
+        return
+    target = Path(a.target).expanduser() if a.target else hooks.default_target()
+    if a.action == "show":
+        sys.stdout.write(hooks.render_snippet())
+    elif a.action in ("install", "uninstall"):
+        r, backup = hooks.apply(target, install=(a.action == "install"), dry_run=a.dry_run)
+        print(f"HOOKS_{a.action.upper()}={r} target={target}" + (f" backup={backup.name}" if backup else ""))
+        if a.action == "install" and r != "DRY_RUN":
+            st, installed, _ = hooks.status(target)
+            print(f"HOOKS_STATUS={st} events={len(installed)}/{len(hooks.EVENTS)}")
+    elif a.action == "status":
+        st, installed, commands = hooks.status(target)
+        print(f"HOOKS_STATUS={st} target={target} events={len(installed)}/{len(hooks.EVENTS)}")
+        missing = [e for e in hooks.EVENTS if e not in installed]
+        if st == "PARTIAL":
+            print("MISSING=" + ",".join(missing))
+        for c in commands:
+            if c != hooks.hook_command():
+                print(f"WARN=HOOK_COMMAND_DIFFERS installed={c}")
+
+
 def cmd_migrate(a):
     from . import migrate
     for act in migrate.plan_and_apply(dry_run=a.dry_run):
@@ -596,6 +621,7 @@ def build_parser():
 
     p = sp.add_parser("integrate"); p.add_argument("slug"); p.add_argument("--repo"); p.add_argument("--instructions", action="store_true"); p.add_argument("--agent", choices=["all", "claude", "codex", "gemini"], default="all"); p.set_defaults(func=cmd_integrate)
     p = sp.add_parser("integrate-global"); p.add_argument("--agent", choices=["all", "claude", "codex"], default="all"); p.add_argument("--dry-run", action="store_true"); p.set_defaults(func=cmd_integrate_global)
+    p = sp.add_parser("hooks", help="Claude Code hooks: automatic session begin, step logging and close"); p.add_argument("action", choices=["install", "uninstall", "status", "show", "run"]); p.add_argument("event", nargs="?", help="(run) override hook_event_name from stdin"); p.add_argument("--target", help="settings.json to manage (default: ~/.claude/settings.json)"); p.add_argument("--dry-run", action="store_true"); p.set_defaults(func=cmd_hooks)
     p = sp.add_parser("migrate"); p.add_argument("--dry-run", action="store_true"); p.set_defaults(func=cmd_migrate)
     p = sp.add_parser("selftest"); p.add_argument("--full", action="store_true"); p.add_argument("--keep", action="store_true"); p.add_argument("--verbose", "-v", action="store_true"); p.set_defaults(func=cmd_selftest)
     p = sp.add_parser("stress"); p.add_argument("--sessions", type=int, default=10); p.add_argument("--steps", type=int, default=20); p.add_argument("--keep", action="store_true"); p.set_defaults(func=cmd_stress)

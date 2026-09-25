@@ -4,3 +4,5 @@ Global instruction files carry a single managed block `<!-- AI-MEMORY-OS-V4-BEGI
 for `~/.claude/CLAUDE.md` (agent claude) and `~/.codex/AGENTS.md` (agent codex); other agents use `OTHER_AI_AGENT_INSTRUCTIONS.md`.
 Required agent behaviour: detect -> begin -> capture SESSION_ID -> read bounded context -> log meaningful steps with explicit
 binding -> update CURRENT/NEXT at closeout -> finish truthfully. Not every microscopic tool call; never hidden reasoning; never secrets.
+With Claude Code hooks installed (`aimem hooks install`, see `docs/CLAUDE_CODE_HOOKS.md`) detect, begin, step logging and close
+are automatic; the agent keeps the closeout.

@@ -30,5 +30,6 @@ Exit codes: 0 ok · 1 warn/fail · 2 error · 3 conflict (CAS) · 4 recovery/tra
 | `aimem doctor [--deep] [--repair] [--no-repo] [--slug S]` | diagnostics (mutation only with --repair) |
 | `aimem migrate [--dry-run]` | idempotent V3.1.1 -> V4 layout upgrade |
 | `aimem integrate <slug> --instructions` / `aimem integrate-global [--dry-run]` | repo pointer / global managed instruction blocks |
+| `aimem hooks install|uninstall|status|show [--target F] [--dry-run]` / `aimem hooks run` | Claude Code hooks: automatic begin, step logging, heartbeat, close (`run` is invoked by Claude Code with one JSON event on stdin; never fails) |
 | `aimem selftest [--full] [--keep] [-v]` / `aimem stress [--sessions N --steps N]` | isolated end-to-end tests |
 | `aimem gc [--days N]` / `aimem-detect [dir]` / `aimem-sweep` | housekeeping / detection / passive physical journal |

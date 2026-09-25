@@ -34,6 +34,9 @@ Protocol: `{root}/AI_MEMORY_AGENT_PROTOCOL_V4.md`. Local only: no API, no cloud,
 
 For meaningful work inside a registered project:
 1. Detect: `SLUG="$({root}/bin/aimem-detect "$PWD" 2>/dev/null || true)"`; if empty, memory is not required.
+   If your session context already contains `AIMEM_HOOKS=ACTIVE`, Claude Code hooks opened the session and log
+   prompts, writes, commands and errors automatically: skip steps 2 and 3, use the shown `AIMEM_SESSION_ID` for any
+   manual command, and still do step 4.
 2. Begin: `{root}/bin/aimem begin "$SLUG" --agent {agent} --task "<current task>" --tokens 4500`
    Use `--mode deep --tokens 6000` only when broad historical/recovery context is genuinely required.
    Capture the exact `SESSION_ID=`. Read the returned `CONTEXT=` file first; if `RECONCILIATION=` is not
