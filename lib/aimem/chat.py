@@ -199,6 +199,6 @@ def import_packet(slug, packet_path, dry_run=False, note="", session=None):
     provenance.record_fact(slug, "chatgpt.last_import", str(kcopy.name), "CHATGPT_HANDOFF", source_ref=str(kcopy), status="VERIFIED",
                            session=session, evidence_sha256=sha, note=status)
     from . import index as indexmod
-    indexmod.reindex(slug, quiet=True)
+    indexmod.reindex(slug, quiet=True, best_effort=True)
     result.update({"stored_path": str(kcopy), "object": str(opath), "report": str(rp), "deduplicated": dedup})
     return result

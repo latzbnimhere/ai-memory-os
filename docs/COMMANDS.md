@@ -29,7 +29,7 @@ Every command that takes a project slug refuses unknown or unsafe slugs (exit 2)
 | `aimem health [slug] [--verbose] [--json] [--no-repo]` | compact health with exit codes |
 | `aimem dashboard [--port N]` / `--status` / `--stop` | local dashboard on 127.0.0.1 only |
 | `aimem backup [--label] [--verify] [--output-dir]` / `aimem backups` / `aimem restore <file> --verify` / `aimem restore <file> --confirm` | backup/restore |
-| `aimem doctor [--deep] [--repair] [--no-repo] [--slug S]` | diagnostics; `--repair` resolves transactions, quarantines torn journal lines (original preserved in `cold/quarantine/`), removes stale temp files, rebuilds a corrupt index. Never deletes checkpoints |
+| `aimem doctor [--deep] [--repair] [--no-repo] [--slug S]` | diagnostics; `--repair` resolves transactions, quarantines torn journal lines (original preserved in `cold/quarantine/`), removes stale temp files, quarantines + rebuilds a broken index (`memory.db BROKEN CORRUPT|UNREADABLE`; a busy index is only a warning). Never deletes checkpoints |
 | `aimem migrate [--dry-run]` | idempotent, additive layout upgrade; refuses roots/configs/manifests written by a newer engine |
 | `aimem integrate <slug> --instructions` / `aimem integrate-global [--dry-run]` | repo pointer / global managed instruction blocks |
 | `aimem selftest [--full] [--keep] [-v]` / `aimem stress [--sessions N --steps N]` | isolated end-to-end tests |

@@ -47,6 +47,11 @@
 - Retrieval: FTS5 bm25 re-ranked by kind authority, recency, current-checkpoint, verified provenance, phrase and label
   match; ties broken by (path, chunk). The index refreshes incrementally (per-file size/mtime, then sha256) and search
   refreshes the project first, so it sees journal entries written since the last finish.
+- Index health is classified explicitly (`index.classify_integrity`): OK, MISSING_REBUILDABLE, CORRUPT (integrity_check
+  returned problem rows), UNREADABLE (the check itself raised a corruption error), UNAVAILABLE (locked/busy). CORRUPT and
+  UNREADABLE are both "broken" (`index.db_is_broken`): which one a given damage produces varies by SQLite build. Only
+  broken indexes are quarantined; a busy one never is. Index refreshes after a committed canonical write are
+  best-effort: the derived index can never turn a committed finish/checkpoint into a failure.
 - Compaction is rules-based (no LLM), idempotent, rebuildable, provenance-linked (source hashes), interruption-safe.
 
 ## Context packs (`begin`, `aimem context`)

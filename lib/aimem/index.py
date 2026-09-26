@@ -17,6 +17,7 @@ then sha256) and can always be rebuilt from canonical files with `aimem reindex 
 from __future__ import annotations
 
 import math
+import os
 import re
 import sqlite3
 import sys
@@ -33,9 +34,55 @@ KIND_WEIGHT = {
 }
 
 
+# ---------------------------------------------------------------- health classification
+#
+# SQLite reports a damaged database file in two equally legitimate ways, and which one you get
+# for the SAME bytes depends on the SQLite build (version, compile options, platform):
+#   - PRAGMA integrity_check completes and returns problem rows      -> "CORRUPT:<first row>"
+#   - the check itself raises (malformed image, not a database,
+#     string or blob too big, ...)                                     -> "UNREADABLE:<error>"
+# Both mean "this derived index is broken: quarantine and rebuild". Anything that only means the
+# file is temporarily inaccessible (locked/busy) is "UNAVAILABLE:<error>" and is NOT broken:
+# repairing it would quarantine a healthy index. Callers must use db_is_broken(), never a prefix.
+DB_OK = "OK"
+DB_MISSING = "MISSING_REBUILDABLE"
+DB_BROKEN_PREFIXES = ("CORRUPT:", "UNREADABLE:")
+DB_UNAVAILABLE_PREFIX = "UNAVAILABLE:"
+_CORRUPTION_MARKERS = ("malformed", "not a database", "disk image", "file is encrypted", "corrupt", "too big",
+                       "database schema", "no such table", "no such column", "vtable constructor failed")
+
+
+def db_is_broken(status):
+    return str(status or "").startswith(DB_BROKEN_PREFIXES)
+
+
+def is_corruption_error(exc):
+    """True when an sqlite3 exception means the index file itself is damaged (rebuild), False for
+    transient conditions (locked/busy) and for API misuse (ProgrammingError = a bug to surface)."""
+    if isinstance(exc, (sqlite3.ProgrammingError, sqlite3.NotSupportedError)):
+        return False
+    msg = str(exc).lower()
+    if isinstance(exc, sqlite3.OperationalError):
+        return any(m in msg for m in _CORRUPTION_MARKERS)
+    return isinstance(exc, sqlite3.DatabaseError)  # DatabaseError/DataError/IntegrityError/InternalError
+
+
+def classify_integrity(rows=None, exc=None):
+    """Map an integrity_check outcome (its rows, or the exception it raised) to a health status."""
+    if exc is not None:
+        if isinstance(exc, sqlite3.Error) and not is_corruption_error(exc):
+            return f"{DB_UNAVAILABLE_PREFIX}{exc}"
+        return f"UNREADABLE:{exc}"
+    rows = [r[0] for r in (rows or [])]
+    if rows == ["ok"]:
+        return DB_OK
+    return f"CORRUPT:{rows[0] if rows else 'integrity_check returned no rows'}"
+
+
 def _quarantine_db(reason):
-    """The FTS index is derived and rebuildable: move a corrupt file aside, never delete it."""
-    tag = core.stamp()
+    """The FTS index is derived and rebuildable: move a corrupt file aside, never delete it.
+    Caller holds the "index" lock."""
+    tag = f"{core.stamp()}-{os.getpid()}-{time.time_ns() % 1000000:06d}"  # unique: never overwrite an earlier quarantine
     for suf in ("", "-wal", "-shm"):
         q = Path(str(DB) + suf)
         if q.exists():
@@ -96,6 +143,8 @@ def db_connect(migrate=True):
         con = _open()
         ver = con.execute("PRAGMA user_version").fetchone()[0]
     except sqlite3.DatabaseError as e:
+        if not is_corruption_error(e):
+            raise
         _quarantine_db(str(e))
         con = _open()
         ver = 0
@@ -277,19 +326,38 @@ def _locked_refresh(slug=None, full=False, verify_fts=True):
         con.close()
 
 
-def reindex(slug=None, quiet=False, full=False):
-    """Incrementally refresh the derived index (full=True rebuilds the scope from scratch)."""
+def reindex(slug=None, quiet=False, full=False, best_effort=False):
+    """Incrementally refresh the derived index (full=True rebuilds the scope from scratch).
+
+    best_effort=True is for callers that already committed canonical state (finish, checkpoint,
+    imports): the derived index must never turn a committed write into a failure. If the index is
+    busy or the refresh hits a non-corruption SQLite error, it warns and returns None; the next
+    search/reindex refreshes incrementally anyway.
+    """
     core.ensure_root()
     if slug and not project_dir(slug).exists():
         core.die(f"Unknown project: {slug}")
-    with core.lock("index", timeout=120):
+    with core.lock("index", timeout=120 if not best_effort else 30, required=not best_effort) as got:
+        if not got:
+            print("WARN: INDEX_REFRESH_DEFERRED (index busy); canonical state is committed; next search refreshes it",
+                  file=sys.stderr)
+            return None
         try:
-            files, chunks, changed, removed = _locked_refresh(slug, full=full)
-        except sqlite3.DatabaseError as e:
-            # corrupt derived index: quarantine (never delete) and rebuild everything from canonical files
-            _quarantine_db(str(e))
-            _locked_refresh(None, full=True)
-            files, chunks, changed, removed = _locked_refresh(slug)
+            try:
+                files, chunks, changed, removed = _locked_refresh(slug, full=full)
+            except sqlite3.DatabaseError as e:
+                if not is_corruption_error(e):
+                    raise
+                # corrupt derived index: quarantine (never delete) and rebuild everything from canonical files
+                _quarantine_db(str(e))
+                _locked_refresh(None, full=True)
+                files, chunks, changed, removed = _locked_refresh(slug)
+        except sqlite3.Error as e:
+            if not best_effort:
+                raise
+            print(f"WARN: INDEX_REFRESH_DEFERRED ({type(e).__name__}: {e}); canonical state is committed",
+                  file=sys.stderr)
+            return None
     if not quiet:
         print(f"REINDEX=PASS files={files} chunks={chunks} changed={changed} removed={removed} "
               f"mode={'full' if full else 'incremental'} db={DB}")
@@ -359,36 +427,41 @@ def fts_search(slug, query, limit=12, refresh=True):
                 if got:
                     _locked_refresh(slug, verify_fts=False)
         rows = _query(slug, match, limit)
-    except sqlite3.OperationalError as e:
-        if "malformed" in str(e) or "not a database" in str(e):
+    except sqlite3.DatabaseError as e:
+        if is_corruption_error(e):
             rows = _recover_and_query(slug, match, limit, e)
         else:
-            rows = []  # malformed MATCH expression: no results rather than a crash
-    except sqlite3.DatabaseError as e:
-        rows = _recover_and_query(slug, match, limit, e)
+            rows = []  # malformed MATCH expression or a busy index: no results rather than a crash
     return _rerank(rows, query, slug, limit)
 
 
 def _recover_and_query(slug, match, limit, err):
     """Corrupt derived index: quarantine (never delete), rebuild from canonical files, retry once."""
-    reindex(None, quiet=True, full=True)  # reindex quarantines on DatabaseError itself
-    if db_health() != "OK":
-        with core.lock("index", timeout=120):
-            _quarantine_db(str(err))
-            _locked_refresh(None, full=True)
     try:
+        reindex(None, quiet=True, full=True)  # reindex quarantines on corruption itself
+        if db_is_broken(db_health()):  # damage the rebuild did not touch (e.g. free pages)
+            with core.lock("index", timeout=120):
+                _quarantine_db(str(err))
+                _locked_refresh(None, full=True)
         return _query(slug, match, limit)
-    except sqlite3.DatabaseError:
-        return []
+    except sqlite3.Error:
+        return []  # never crash begin/search on a derived index; doctor reports what is left
 
 
 def db_health():
+    """OK | MISSING_REBUILDABLE | CORRUPT:<row> | UNREADABLE:<error> | UNAVAILABLE:<error>.
+    Use db_is_broken() to decide whether it needs quarantine + rebuild (see classify_integrity)."""
     if not DB.exists():
-        return "MISSING_REBUILDABLE"
+        return DB_MISSING
+    con = None
     try:
         con = sqlite3.connect(str(DB), timeout=30)
-        ok = con.execute("PRAGMA integrity_check").fetchone()[0]
-        con.close()
-        return "OK" if ok == "ok" else f"CORRUPT:{ok}"
-    except Exception as e:
-        return f"UNREADABLE:{e}"
+        return classify_integrity(rows=con.execute("PRAGMA integrity_check(20)").fetchall())
+    except Exception as e:  # noqa: BLE001 - any failure to even check is a classified result, never a crash
+        return classify_integrity(exc=e)
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:  # noqa: BLE001
+                pass

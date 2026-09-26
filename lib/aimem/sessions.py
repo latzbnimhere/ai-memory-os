@@ -277,7 +277,7 @@ def finish(slug, session=None, result="", label=None, summary="", allow_unchange
         cp_id, version, lbl = _finish_locked(slug, session, result, label, summary, allow_unchanged, no_advance_current,
                                              expect_version, acknowledge_newer, allow_secret_pattern)
     publish_checkpoint(slug, lbl, result)
-    indexmod.reindex(slug, quiet=True)
+    indexmod.reindex(slug, quiet=True, best_effort=True)  # derived: never fails a committed finish
     return cp_id, version
 
 

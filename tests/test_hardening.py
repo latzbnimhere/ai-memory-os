@@ -539,39 +539,6 @@ class TestDoctor(Base):
 class TestReviewFindings(Base):
     """Regressions for issues found by adversarial review of this hardening round."""
 
-    def test_corrupt_index_pages_do_not_break_begin_or_search(self):
-        from aimem import index
-        kdir = self.p / "knowledge"
-        kdir.mkdir(exist_ok=True)
-        for i in range(200):
-            (kdir / f"k{i}.md").write_text(f"# note {i}\n" + ("alpha beta gamma delta " * 60) + f"marmot{i}\n")
-        index.reindex(None, quiet=True, full=True)
-        with core.lock("index"):
-            con = index.db_connect()
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            con.close()
-        size = core.DB.stat().st_size
-        self.assertGreater(size, 64 * 1024)
-        with core.DB.open("r+b") as f:  # header intact, interior pages destroyed
-            f.seek(size // 2)
-            f.write(b"\xff" * 8192)
-        r = run("search", "hard", "marmot7")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertNotIn("Traceback", r.stderr)
-        self.close_all()
-        r = run("begin", "hard", "--agent", "other", "--task", "after corruption")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.close_all()
-        # corruption on pages a query never touches is healed by the finish-time reindex (full consistency
-        # scan) or by `doctor --repair`; either way the canonical files rebuild it
-        if index.db_health() != "OK":
-            r = run("doctor", "--no-repo", "--slug", "hard")
-            self.assertIn("memory.db CORRUPT", r.stdout)
-            run("doctor", "--no-repo", "--slug", "hard", "--repair")
-        self.assertEqual(index.db_health(), "OK")
-        self.assertTrue(index.fts_search("hard", "marmot7"))
-        shutil.rmtree(kdir)
-
     def test_unicode_line_separators_do_not_drop_records(self):
         f = self.p / "u2028.jsonl"
         core.append_jsonl(f, {"n": 1})
@@ -663,6 +630,208 @@ class TestReviewFindings(Base):
             self.assertEqual(core.version_tuple("V3.1.1"), (3, 1, 1))
         finally:
             sessions.session_file("hard", sid).unlink()
+
+
+def _mid_ff(b):
+    n = len(b) // 2
+    return b[:n] + b"\xff" * 8192 + b[n + 8192:]
+
+
+def _mid_zero(b):
+    n = len(b) // 2
+    return b[:n] + b"\x00" * 8192 + b[n + 8192:]
+
+
+def _rand_pages(b):
+    import random
+    r, b = random.Random(3), bytearray(b)
+    for _ in range(6):
+        o = r.randrange(4096, len(b) - 4096)
+        b[o:o + 512] = bytes(r.randrange(256) for _ in range(512))
+    return bytes(b)
+
+
+# Deterministic damage patterns. The SAME bytes are reported as CORRUPT (integrity_check returns
+# rows) by some SQLite builds and UNREADABLE (integrity_check raises: "malformed", "string or blob
+# too big", ...) by others, e.g. macOS/Python 3.9 vs 3.12. The contract is behavioural, so the
+# tests accept either broken class but never OK/UNAVAILABLE, and never a crash.
+CORRUPTIONS = {
+    "mid_pages_ff": _mid_ff,
+    "mid_pages_zero": _mid_zero,
+    "random_pages": _rand_pages,
+    "truncated": lambda b: b[: len(b) // 2],
+    "bad_header": lambda b: b"not a database" * 8 + b[112:],
+}
+
+
+class TestIndexRecoveryContract(Base):
+    """A broken derived index must never crash begin/search, must be detected by doctor, must be
+    quarantined + rebuilt by doctor --repair, and must never cause canonical data to change."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        kdir = cls.p / "knowledge"
+        kdir.mkdir(exist_ok=True)
+        for i in range(200):
+            (kdir / f"k{i}.md").write_text(f"# note {i}\n" + ("alpha beta gamma delta " * 60) + f"marmot{i}\n")
+
+    def fresh_index(self):
+        from aimem import index
+        with core.lock("index"):
+            for suf in ("", "-wal", "-shm"):
+                Path(str(core.DB) + suf).unlink(missing_ok=True)
+        index.reindex(None, quiet=True, full=True)
+        with core.lock("index"):
+            con = index.db_connect()
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            con.close()
+        self.assertEqual(index.db_health(), index.DB_OK)
+        self.assertGreater(core.DB.stat().st_size, 64 * 1024)
+
+    def corrupt(self, fn):
+        for suf in ("-wal", "-shm"):
+            Path(str(core.DB) + suf).unlink(missing_ok=True)
+        core.DB.write_bytes(fn(core.DB.read_bytes()))
+
+    def snapshot(self, include=lambda rel: True):
+        root = Path(core.ROOT) / "projects"
+        return {str(f.relative_to(root)): core.sha256_file(f) for f in sorted(root.rglob("*"))
+                if f.is_file() and include(f.relative_to(root))}
+
+    def quarantined(self):
+        return sorted(core.DB.parent.glob("memory.db.corrupt-*"))
+
+    def test_doctor_detects_and_repairs_every_corruption_mode(self):
+        from aimem import index
+        import re
+        for name, fn in CORRUPTIONS.items():
+            with self.subTest(corruption=name):
+                self.fresh_index()
+                canonical = self.snapshot()
+                q_before = len(self.quarantined())
+                self.corrupt(fn)
+                status = index.db_health()
+                self.assertTrue(index.db_is_broken(status), f"{name}: undetected, db_health={status!r}")
+                r = run("doctor", "--no-repo", "--slug", "hard")
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertRegex(r.stdout, r"ERROR: memory\.db BROKEN (CORRUPT|UNREADABLE):")
+                r = run("doctor", "--no-repo", "--slug", "hard", "--repair")
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("memory.db rebuilt (health OK)", r.stdout)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertGreater(len(self.quarantined()), q_before, "damaged file must be kept, not deleted")
+                self.assertEqual(index.db_health(), index.DB_OK)
+                self.assertTrue(index.fts_search("hard", "marmot7"))
+                self.assertEqual(self.snapshot(), canonical, "repairing the index must not touch canonical data")
+                self.assertIsNone(re.search(r"memory\.db", run("doctor", "--no-repo", "--slug", "hard").stdout))
+
+    def test_begin_and_search_never_crash_on_any_corruption_mode(self):
+        from aimem import index
+        protected = lambda rel: rel.parts[1] in ("CURRENT.md", "NEXT.md", "project.json", "DECISIONS.jsonl",
+                                                 "checkpoints", "knowledge") if len(rel.parts) > 1 else False
+        for name, fn in CORRUPTIONS.items():
+            with self.subTest(corruption=name):
+                self.close_all()
+                self.fresh_index()
+                canonical = self.snapshot(protected)
+                self.corrupt(fn)
+                r = run("search", "hard", "marmot7")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                r = run("begin", "hard", "--agent", "other", "--task", f"after {name} marmot7")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.close_all()
+                # damage on pages no query touched may survive search; one doctor --repair always heals it
+                if index.db_health() != index.DB_OK:
+                    self.assertTrue(index.db_is_broken(index.db_health()))
+                    self.assertEqual(run("doctor", "--no-repo", "--slug", "hard", "--repair").returncode, 0)
+                self.assertEqual(index.db_health(), index.DB_OK)
+                self.assertTrue(index.fts_search("hard", "marmot7"))
+                self.assertEqual(self.snapshot(protected), canonical)
+
+    def test_classification_is_explicit_and_portable(self):
+        import sqlite3
+        from aimem import index
+        broken = [
+            index.classify_integrity(exc=sqlite3.DataError("string or blob too big")),  # macOS / Python 3.9 CI
+            index.classify_integrity(exc=sqlite3.DatabaseError("database disk image is malformed")),
+            index.classify_integrity(exc=sqlite3.DatabaseError("file is not a database")),
+            index.classify_integrity(exc=sqlite3.OperationalError("database disk image is malformed")),
+            index.classify_integrity(rows=[("*** in database main ***",), ("Tree 8 page 3: btreeInitPage() returns error code 11",)]),
+            index.classify_integrity(rows=[]),
+            index.classify_integrity(exc=OSError("I/O error reading file")),
+        ]
+        for st in broken:
+            self.assertTrue(index.db_is_broken(st), st)
+            self.assertTrue(st.startswith(("CORRUPT:", "UNREADABLE:")), st)
+        self.assertEqual(index.classify_integrity(rows=[("ok",)]), index.DB_OK)
+        busy = index.classify_integrity(exc=sqlite3.OperationalError("database is locked"))
+        self.assertTrue(busy.startswith(index.DB_UNAVAILABLE_PREFIX))
+        self.assertFalse(index.db_is_broken(busy))
+        self.assertFalse(index.db_is_broken(index.DB_MISSING))
+        self.assertFalse(index.is_corruption_error(sqlite3.ProgrammingError("Cannot operate on a closed database.")))
+        self.assertFalse(index.is_corruption_error(sqlite3.OperationalError("fts5: syntax error near \"\"")))
+        self.assertTrue(index.is_corruption_error(sqlite3.DataError("string or blob too big")))
+
+    def _integrity_check_raises(self, exc):
+        """Real SQLite, except that PRAGMA integrity_check raises `exc` (reproduces a platform's error mode)."""
+        import sqlite3
+        from unittest import mock
+        real = sqlite3.connect
+
+        class Con:
+            def __init__(self, c):
+                self._c = c
+
+            def execute(self, sql, *a):
+                if "integrity_check" in sql:
+                    raise exc
+                return self._c.execute(sql, *a)
+
+            def __getattr__(self, name):
+                return getattr(self._c, name)
+
+        return mock.patch.object(sqlite3, "connect", side_effect=lambda *a, **k: Con(real(*a, **k)))
+
+    def test_macos_py39_error_mode_is_detected_by_doctor_and_health(self):
+        import sqlite3
+        from aimem import doctor, health, index
+        self.fresh_index()
+        with self._integrity_check_raises(sqlite3.DataError("string or blob too big")):
+            self.assertEqual(index.db_health(), "UNREADABLE:string or blob too big")
+            errors, _w, _i = doctor.run(deep=False, check_repo=False, slug_filter="hard")
+            self.assertTrue(any(e.startswith("memory.db BROKEN UNREADABLE:string or blob too big") for e in errors), errors)
+            h = health.collect("hard", check_repo=False)
+            self.assertEqual(h["AI_MEMORY_HEALTH"], "FAIL")
+        self.assertEqual(index.db_health(), index.DB_OK)
+
+    def test_busy_index_is_never_quarantined(self):
+        import sqlite3
+        from aimem import doctor, index
+        self.fresh_index()
+        inode = core.DB.stat().st_ino
+        q_before = len(self.quarantined())
+        with self._integrity_check_raises(sqlite3.OperationalError("database is locked")):
+            errors, warnings, _i = doctor.run(deep=False, check_repo=False, repair=True, slug_filter="hard")
+            self.assertFalse([e for e in errors if e.startswith("memory.db")], errors)
+            self.assertTrue(any(w.startswith("memory.db UNAVAILABLE:") for w in warnings), warnings)
+        self.assertEqual(core.DB.stat().st_ino, inode, "a busy index must not be moved aside")
+        self.assertEqual(len(self.quarantined()), q_before)
+
+    def test_committed_finish_survives_unusable_index(self):
+        from aimem import index
+        from unittest import mock
+        import sqlite3
+        self.close_all()
+        sid = self.begin("finish with broken index")
+        (self.p / "CURRENT.md").write_text((self.p / "CURRENT.md").read_text() + "\n- finish-index-test\n")
+        with mock.patch.object(index, "_locked_refresh", side_effect=sqlite3.OperationalError("database is locked")):
+            cp, version = sessions.finish("hard", sid, "PASS", "idx")
+        self.assertTrue((self.p / "checkpoints" / cp / "meta.json").exists())
+        self.assertEqual(core.project_manifest("hard")["current_checkpoint"], cp)
+        self.assertEqual(json.loads(sessions.session_file("hard", sid).read_text())["status"], "CLOSED")
 
 
 if __name__ == "__main__":

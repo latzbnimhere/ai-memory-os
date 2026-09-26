@@ -98,7 +98,7 @@ def cmd_register(a):
     core.save_registry(reg)
     append_jsonl(p / "EVENTS.jsonl", {"time": iso(), "kind": "project_registered", "slug": slug, "repo": repo})
     core.rebuild_master_index()
-    index.reindex(slug, quiet=True)
+    index.reindex(slug, quiet=True, best_effort=True)
     core.git_memory_commit(f"{slug}: registered")
     print(f"REGISTERED={slug} repo={repo or '(none)'}")
 
@@ -180,7 +180,7 @@ def cmd_checkpoint(a):
     cp, version = sessions.create_checkpoint(a.slug, a.label, a.result, a.summary or "", a.session, not a.no_advance_current, a.expect_version,
                                              a.allow_secret_pattern)
     from . import index
-    index.reindex(a.slug, quiet=True)
+    index.reindex(a.slug, quiet=True, best_effort=True)
     print(cp)
     print(f"MEMORY_VERSION={version}")
 
@@ -335,7 +335,7 @@ def cmd_compact(a):
     if not a.dry_run:
         from . import index
         for slug in slugs:
-            index.reindex(slug, quiet=True)
+            index.reindex(slug, quiet=True, best_effort=True)
 
 
 def cmd_objects(a):

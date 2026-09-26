@@ -270,8 +270,11 @@ def run(deep=False, check_repo=True, repair=False, slug_filter=None):
         info.append(f"objects verified={ok}")
     # DB
     dbh = index.db_health()
-    if dbh.startswith("CORRUPT") or dbh.startswith("UNREADABLE"):
-        errors.append(f"memory.db {dbh}")
+    if index.db_is_broken(dbh):
+        errors.append(f"memory.db BROKEN {dbh.splitlines()[0][:200]} (derived index; `aimem doctor --repair` "
+                      "quarantines and rebuilds it from canonical files)")
+    elif dbh.startswith(index.DB_UNAVAILABLE_PREFIX):
+        warnings.append(f"memory.db {dbh[:200]} (busy/locked; not treated as damage; re-run doctor)")
     # LaunchAgent
     if LAUNCH_AGENT.exists():
         try:
@@ -289,13 +292,14 @@ def run(deep=False, check_repo=True, repair=False, slug_filter=None):
         for slug in slugs:
             for rid, action in txn.repair(slug):
                 info.append(f"{slug}: txn {rid} -> {action}")
-        if dbh != "OK":
-            if dbh.startswith(("CORRUPT", "UNREADABLE")):
+        if index.db_is_broken(dbh) or dbh == index.DB_MISSING:
+            if index.db_is_broken(dbh):
                 with core.lock("index", timeout=120):
-                    index._quarantine_db(dbh)
+                    index._quarantine_db(dbh.splitlines()[0][:200])
             index.reindex(None, quiet=True, full=True)
-            info.append("memory.db rebuilt")
-            if index.db_health() == "OK":
+            after = index.db_health()
+            info.append(f"memory.db rebuilt (health {after})")
+            if after == index.DB_OK:
                 errors = [e for e in errors if not e.startswith("memory.db")]
     return errors, warnings, info
 

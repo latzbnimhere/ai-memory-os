@@ -86,7 +86,7 @@ def collect(slug_filter=None, check_repo=True):
         h["disk_free"] = "-"
     # overall
     level = 0
-    if h["recovery_required"] or h["unresolved_transactions"] or h["doctor_errors"] or h["database"].startswith("CORRUPT") or h["checkpoint_integrity"] != "OK":
+    if h["recovery_required"] or h["unresolved_transactions"] or h["doctor_errors"] or index.db_is_broken(h["database"]) or h["checkpoint_integrity"] != "OK":
         level = 2
     elif h["stale_sessions"] or h["abandoned_sessions"] or h["ambiguous_sessions"] or h["doctor_warnings"] or h["backup_status"] in ("NONE", "OLD_UNVERIFIED", "OLD_VERIFIED", "OK_UNVERIFIED") \
             or h["provenance_warnings"] or h["context_size_warnings"] or any(_needs_attention(v) for v in h["match_status"].values()):
