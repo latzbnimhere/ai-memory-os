@@ -7,7 +7,7 @@
 Gates (all must pass before any live mutation): zero OPEN sessions on the target root (checked at preflight, before
 the backup and again immediately before the first mutation), unit tests on an isolated root, full isolated selftest,
 baseline doctor --deep on the target root, fresh verified backup of the target root. After install: migrate,
-doctor --deep, health, hash verification, functional smoke (begin/step/finish on the ai-memory slug). Any failure after
+doctor --deep, health, hash verification, functional smoke (begin/step/finish on --smoke-slug, default ai-memory). Any failure after
 the first mutation -> rollback to the preserved pre-promotion files; a failure before it leaves the root untouched.
 """
 from __future__ import annotations
@@ -46,8 +46,9 @@ def run(cmd, env=None, timeout=900, check=False):
 
 
 class Promotion:
-    def __init__(self, root: Path, live: bool, backup_dir: Path, skip_selftest=False):
+    def __init__(self, root: Path, live: bool, backup_dir: Path, skip_selftest=False, smoke_slug="ai-memory"):
         self.root = root
+        self.smoke_slug = smoke_slug
         self.live = live
         self.backup_dir = backup_dir
         self.skip_selftest = skip_selftest
@@ -197,14 +198,14 @@ class Promotion:
     def smoke(self):
         v4 = self.root / "bin" / "aimem"
         step = self.root / "bin" / "aimem-step"
-        rc, out = run([sys.executable, str(v4), "begin", "ai-memory", "--agent", "other", "--task", "promotion smoke test", "--tokens", "2000"], env=self.env)
+        rc, out = run([sys.executable, str(v4), "begin", self.smoke_slug, "--agent", "other", "--task", "promotion smoke test", "--tokens", "2000"], env=self.env)
         self.gate("SMOKE_BEGIN", rc == 0 and "SESSION_ID=" in out, out)
         sid = next(l.split("=", 1)[1] for l in out.splitlines() if l.startswith("SESSION_ID="))
-        rc, out = run([sys.executable, str(step), "--project", "ai-memory", "--session", sid, "--kind", "test", "--summary", "promotion smoke step", "--result", "PASS"], env=self.env)
+        rc, out = run([sys.executable, str(step), "--project", self.smoke_slug, "--session", sid, "--kind", "test", "--summary", "promotion smoke step", "--result", "PASS"], env=self.env)
         self.gate("SMOKE_STEP", rc == 0 and "binding=explicit" in out, out)
-        rc, out = run([sys.executable, str(v4), "finish", "ai-memory", "--session", sid, "--result", "PASS", "--label", "v4-promotion-smoke", "--allow-unchanged", "--no-advance-current"], env=self.env)
+        rc, out = run([sys.executable, str(v4), "finish", self.smoke_slug, "--session", sid, "--result", "PASS", "--label", "v4-promotion-smoke", "--allow-unchanged", "--no-advance-current"], env=self.env)
         self.gate("SMOKE_FINISH_ADMIN", rc == 0 and "FINISH=PASS" in out, out)
-        rc, out = run([sys.executable, str(v4), "search", "ai-memory", "V4"], env=self.env)
+        rc, out = run([sys.executable, str(v4), "search", self.smoke_slug, "V4"], env=self.env)
         self.gate("SMOKE_SEARCH", rc == 0, out)
         rc, out = run([sys.executable, str(v4), "recover"], env=self.env)
         self.report["recover_scan"] = out[-2000:]
@@ -353,7 +354,7 @@ def rehearse(args, source_root):
                        "events_lines": sum(1 for _ in open(p / "EVENTS.jsonl")) if (p / "EVENTS.jsonl").exists() else 0}
         return d
     before = canon(copy)
-    pr = Promotion(copy, live=False, backup_dir=tmp / "backups", skip_selftest=args.skip_selftest)
+    pr = Promotion(copy, live=False, backup_dir=tmp / "backups", skip_selftest=args.skip_selftest, smoke_slug=args.smoke_slug)
     rc = pr.run()
     after = canon(copy)
     cmp = {"canonical_preserved": True, "detail": []}
@@ -362,7 +363,7 @@ def rehearse(args, source_root):
         if b["CURRENT"] != a.get("CURRENT") or b["NEXT"] != a.get("NEXT"):
             cmp["canonical_preserved"] = False
             cmp["detail"].append(f"{slug}: CURRENT/NEXT changed")
-        if slug != "ai-memory" and b["current_checkpoint"] != a.get("current_checkpoint"):
+        if slug != args.smoke_slug and b["current_checkpoint"] != a.get("current_checkpoint"):
             cmp["canonical_preserved"] = False
             cmp["detail"].append(f"{slug}: current checkpoint changed")
         if not set(b["checkpoints"]).issubset(set(a.get("checkpoints", []))):
@@ -418,6 +419,11 @@ def main():
         help="reuse an already-passed selftest (rehearsal only)",
     )
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument(
+        "--smoke-slug",
+        default="ai-memory",
+        help="registered project used for the begin/step/finish smoke test (admin checkpoint, CURRENT not advanced)",
+    )
 
     a = ap.parse_args()
 
@@ -459,6 +465,7 @@ def main():
         live=True,
         backup_dir=backup_dir,
         skip_selftest=a.skip_selftest,
+        smoke_slug=a.smoke_slug,
     )
 
     raise SystemExit(pr.run())

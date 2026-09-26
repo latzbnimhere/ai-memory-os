@@ -443,6 +443,19 @@ class TestContextAndRetrieval(Base):
         b = [(h["path"], h["chunk_no"]) for h in index.fts_search("hard", "hard project state")]
         self.assertEqual(a, b)
 
+    def test_index_bookkeeping_drift_forces_project_rebuild(self):
+        from aimem import index
+        run("note", "hard", "--kind", "decision", "--text", "pick platypusplan", check=True)
+        index.reindex("hard", quiet=True)
+        con = index.db_connect()
+        try:  # what a pre-4.2 engine's reindex does after a rollback: rewrite chunks, ignore `files`
+            con.execute("DELETE FROM chunks_meta WHERE project='hard'")
+            con.execute("DELETE FROM chunks_fts WHERE project='hard'")
+            con.commit()
+        finally:
+            con.close()
+        self.assertTrue(index.fts_search("hard", "platypusplan"))
+
     def test_corrupt_index_is_quarantined_and_rebuilt_on_search(self):
         from aimem import index
         run("note", "hard", "--kind", "decision", "--text", "choose wombatstrategy", check=True)

@@ -618,7 +618,15 @@ def main(argv=None):
         core.ensure_root()
         if not core.project_exists(slug):
             die(f"Unknown project: {slug} (registered: {', '.join(core.all_slugs()) or 'none'})")
-    args.func(args)
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        # stdout closed early (e.g. `aimem search ... | head`): not an error of the command itself
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        raise SystemExit(0)
 
 
 if __name__ == "__main__":

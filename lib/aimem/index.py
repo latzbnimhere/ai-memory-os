@@ -190,8 +190,13 @@ def _refresh(con, slug=None, full=False):
     changed, so refreshing a project with a huge history costs one stat() per file.
     """
     scope = [slug] if slug else sorted(registry()["projects"])
-    if full:
-        for s in scope:
+    for s in scope:
+        # Consistency guard: an older engine (e.g. after a rollback) may have rewritten chunks without
+        # maintaining `files`; any disagreement means the bookkeeping cannot be trusted -> rebuild project.
+        tracked = con.execute("SELECT COALESCE(SUM(chunks), 0) FROM files WHERE project=?", (s,)).fetchone()[0]
+        actual = con.execute("SELECT COUNT(*) FROM chunks_meta WHERE project=?", (s,)).fetchone()[0]
+        fts = con.execute("SELECT COUNT(*) FROM chunks_fts WHERE project=?", (s,)).fetchone()[0]
+        if full or tracked != actual or actual != fts:
             for t in ("chunks_meta", "chunks_fts", "files"):
                 con.execute(f"DELETE FROM {t} WHERE project=?", (s,))
     if not slug:
