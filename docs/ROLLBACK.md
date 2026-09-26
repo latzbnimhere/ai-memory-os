@@ -1,4 +1,8 @@
-# Rollback to V3.1.1
+# Rollback
+
+Rolling back 4.2.0 -> 4.1.0: see [UPGRADE_4_2.md](UPGRADE_4_2.md#rollback-420---410).
+
+## Rollback to V3.1.1
 Automatic: `tools/promote.py` restores `bin/*`, protocol files, config, PATCH_LEVEL from `<root>/.previous/v3.1.1-<stamp>/`,
 moves `lib/` aside, restores global instruction files from the promotion backups, and runs the baseline doctor.
 Manual: follow `~/AI-Memory-Backups/v3.1.1-known-good-<stamp>/ROLLBACK_PROCEDURE.md` (executables/config/instructions/LaunchAgent,

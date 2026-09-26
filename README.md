@@ -19,7 +19,7 @@ python3 tools/install.py --root "$HOME/AI-Memory"
 
 The installer is intentionally fail-closed: the target root must not already exist. It copies only the runtime code/docs, initializes a new empty memory root, runs a deep no-repository doctor check, and rolls the new root back if installation fails. It does not modify an existing AI Memory installation, global agent instructions, project repositories, or launch services.
 
-See [Installation](docs/INSTALL.md) for the complete first-run flow. Existing installations should use the controlled promotion/rehearsal path instead of the fresh installer.
+See [Installation](docs/INSTALL.md) for the complete first-run flow. Existing installations should use the controlled promotion/rehearsal path instead of the fresh installer ([upgrading to 4.2](docs/UPGRADE_4_2.md)).
 
 ## First project
 
@@ -44,12 +44,12 @@ SLUG="$(~/AI-Memory/bin/aimem-detect "$PWD")"
 [Installation](docs/INSTALL.md) · [Architecture](docs/ARCHITECTURE.md) · [Commands](docs/COMMANDS.md) · [Agent protocol](docs/AGENT_PROTOCOL.md) ·
 [Recovery](docs/RECOVERY.md) · [Backup/restore](docs/BACKUP_RESTORE.md) · [ChatGPT bridge](docs/CHATGPT_BRIDGE.md) ·
 [Dashboard](docs/DASHBOARD.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Migration from V3.1.1](docs/MIGRATION_V3_1_1_TO_V4.md) ·
-[Rollback](docs/ROLLBACK.md) · [Security / no-API policy](docs/SECURITY_NO_API.md) · [Public safety](docs/PUBLIC_SAFETY.md)
+[Upgrading to 4.2](docs/UPGRADE_4_2.md) · [Rollback](docs/ROLLBACK.md) · [Security / no-API policy](docs/SECURITY_NO_API.md) · [Public safety](docs/PUBLIC_SAFETY.md)
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v    # always runs against a throwaway root/HOME, never ~/AI-Memory
 python3 bin/aimem selftest --full
 python3 tools/public_audit.py
 python3 tools/promote.py --rehearse --root /path/to/AI-Memory
