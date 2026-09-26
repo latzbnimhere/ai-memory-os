@@ -18,17 +18,23 @@ from .core import OBJECTS, ROOT, RUN, atomic_write, atomic_write_json, config, i
 SUPPORTED_CONFIG_VERSION = 4
 
 
+def _safe(slug):
+    try:
+        core.safe_component(slug, "slug")
+        return True
+    except SystemExit:
+        return False
+
+
 def future_blockers():
     """Reasons this engine must not migrate the root (data from a newer engine / unknown schema)."""
-    engine = core.version_tuple(core.VERSION)
     out = []
     vf = ROOT / "VERSION"
     if vf.exists():
-        rv = core.version_tuple(vf.read_text().strip())
-        if rv is None:
-            out.append(f"root VERSION is unparseable: {vf.read_text().strip()[:40]!r}")
-        elif rv > engine:
-            out.append(f"root VERSION {vf.read_text().strip()} is newer than engine {core.VERSION}")
+        rv = vf.read_text().strip()
+        # legacy V3 roots used "2.0.0+V3.1.1"-style strings: numerically older, so still migratable
+        if core.version_not_older(rv) and rv != core.VERSION:
+            out.append(f"root VERSION {rv[:40]!r} is newer than (or a different build of) engine {core.VERSION}, or unparseable")
     cfg = try_load_json(core.CONFIG, {}) or {}
     cv = cfg.get("version")
     if cv is not None and (not isinstance(cv, int) or cv > SUPPORTED_CONFIG_VERSION):
@@ -41,9 +47,9 @@ def future_blockers():
             continue
         if not man or not man.get("engine_version"):
             continue
-        pv = core.version_tuple(man["engine_version"])
-        if pv is None or pv > engine:
-            out.append(f"{slug}: project.json engine_version {man['engine_version']} is newer than engine {core.VERSION}")
+        pv = str(man["engine_version"])
+        if core.version_not_older(pv) and pv != core.VERSION:
+            out.append(f"{slug}: project.json engine_version {pv[:40]} is newer than (or a different build of) engine {core.VERSION}")
     return out
 
 
@@ -53,6 +59,11 @@ def plan_and_apply(dry_run=False):
     if blockers:
         core.die("MIGRATE_REFUSED_NEWER_DATA: " + "; ".join(blockers[:10]) +
                  ". This engine will not rewrite data from a newer engine or unknown schema; install the newer engine.")
+    from . import txn
+    pend = [s for s in sorted(registry()["projects"]) if _safe(s) and txn.pending(s)]
+    if pend:
+        core.die("MIGRATE_REFUSED_PENDING_TRANSACTIONS: " + ", ".join(pend) + ". Rewriting project.json now could make a "
+                 "roll-forward impossible; resolve with `aimem txn <slug> --repair` first.", core.EXIT_RECOVERY_REQUIRED)
     actions = []
     reg = registry()
     for d in (OBJECTS / "sha256", RUN):

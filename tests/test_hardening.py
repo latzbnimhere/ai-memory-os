@@ -584,19 +584,6 @@ class TestReviewFindings(Base):
             out = "".join(context.allocate(secs, budget))
             self.assertLessEqual(len(out), budget)
 
-    def test_txn_discard_is_explicit_and_journaled(self):
-        t = txn.Transaction("hard")
-        t.stage(self.p / "NEXT.md", "STALE\n")
-        t._record("PREPARED")
-        before = (self.p / "NEXT.md").read_text()
-        r = run("txn", "hard", "--discard", t.id)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn(f"TXN_DISCARDED={t.id}", r.stdout)
-        self.assertEqual(txn.pending("hard"), [])
-        self.assertEqual((self.p / "NEXT.md").read_text(), before)
-        self.assertFalse(list(self.p.glob(".NEXT.md.*.staged")))
-        self.assertEqual(run("txn", "hard", "--discard", "nope").returncode, 2)
-
     def test_backup_with_external_symlink_and_hardlink_verifies(self):
         from aimem import backup
         ext = _isolation.SANDBOX / "outside-target.txt"
@@ -832,6 +819,232 @@ class TestIndexRecoveryContract(Base):
         self.assertTrue((self.p / "checkpoints" / cp / "meta.json").exists())
         self.assertEqual(core.project_manifest("hard")["current_checkpoint"], cp)
         self.assertEqual(json.loads(sessions.session_file("hard", sid).read_text())["status"], "CLOSED")
+
+
+class TestTransactionReviewFindings(Base):
+    """Regressions from the final adversarial review of transaction integrity."""
+
+    def setUp(self):
+        for t in txn.pending("hard"):
+            txn.discard("hard", t["id"], force=True)
+        self.cur, self.nxt = self.p / "CURRENT.md", self.p / "NEXT.md"
+
+    def _torn_write_current(self):
+        """A write-current killed after CURRENT.md was replaced but before NEXT.md (COMMITTING, half applied)."""
+        t = txn.Transaction("hard", kind="write_current")
+        t.stage(self.cur, "CUR-NEW\n")
+        t.stage(self.nxt, "NEXT-NEW\n")
+        t._record("PREPARED")
+        t._record("COMMITTING")
+        os.replace(t.entries[0]["staged"], t.entries[0]["target"])
+        return t
+
+    def test_discard_refuses_clean_roll_forward_and_never_deletes_content(self):
+        t = txn.Transaction("hard")
+        t.stage(self.nxt, "NEVER-APPLIED\n")
+        t._record("PREPARED")
+        before = self.nxt.read_text()
+        r = run("txn", "hard", "--discard", t.id)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("REFUSED", r.stderr)
+        self.assertEqual(len(txn.pending("hard")), 1)
+        r = run("txn", "hard", "--discard", t.id, "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"NEVER_APPLIED={self.nxt}", r.stdout)
+        self.assertEqual(txn.pending("hard"), [])
+        self.assertEqual(self.nxt.read_text(), before)
+        q = self.p / "cold" / "quarantine" / f"txn-{t.id}"
+        self.assertIn("NEVER-APPLIED", "".join(f.read_text() for f in q.iterdir() if f.name.endswith(".staged")))
+        self.assertTrue((q / f"{t.id}.json").exists())
+        self.assertEqual(run("txn", "hard", "--discard", "nope").returncode, 2)
+
+    def test_repair_of_copied_root_repairs_the_copy_not_the_original(self):
+        orig_next = self.nxt.read_text()
+        t = self._torn_write_current()
+        copy = _isolation.SANDBOX / "copied-root"
+        shutil.rmtree(copy, ignore_errors=True)
+        shutil.copytree(core.ROOT, copy, ignore=shutil.ignore_patterns(".locks"))
+        env = dict(os.environ, AI_MEMORY_ROOT=str(copy), PYTHONPATH=str(REPO / "lib"))
+        r = subprocess.run([sys.executable, str(AIMEM), "txn", "hard", "--repair"], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ROLLED_FORWARD", r.stdout)
+        cp = copy / "projects" / "hard"
+        self.assertEqual((cp / "NEXT.md").read_text(), "NEXT-NEW\n")
+        self.assertEqual(self.nxt.read_text(), orig_next, "repair on a copy must never write into the original root")
+        # legacy records (absolute paths only) on a copy fail closed instead
+        rec_path = next((cp / ".txn").glob("*.json"), None)
+        self.assertIsNone(rec_path)
+        legacy = copy / "projects" / "hard" / ".txn" / "legacy.json"
+        rec = json.loads(Path(t.record_path).read_text())
+        for e in rec["entries"]:
+            e.pop("target_rel"); e.pop("staged_rel")
+        legacy.write_text(json.dumps(rec))
+        r = subprocess.run([sys.executable, str(AIMEM), "txn", "hard", "--repair"], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, core.EXIT_RECOVERY_REQUIRED, r.stdout)
+        self.assertIn("PATHS_OUTSIDE_PROJECT_MANUAL_REVIEW", r.stdout)
+        self.assertEqual(self.nxt.read_text(), orig_next)
+        shutil.rmtree(copy)
+        self.assertEqual(txn.repair("hard")[0][1], "ROLLED_FORWARD")  # the original's own txn still repairs
+
+    def test_committing_entry_missing_staged_must_hold_new_content(self):
+        t = self._torn_write_current()
+        self.cur.write_text("EDITED AFTER CRASH\n")  # the applied target was changed since
+        self.assertEqual(txn.inspect("hard")[0]["resolution"], "MANUAL_TARGET_CHANGED")
+        r = run("txn", "hard", "--repair")
+        self.assertEqual(r.returncode, core.EXIT_RECOVERY_REQUIRED, "manual leftovers keep exit 4")
+        self.assertIn("TARGET_CHANGED_SINCE_PREPARE_MANUAL_REVIEW", r.stdout)
+        self.assertEqual(self.cur.read_text(), "EDITED AFTER CRASH\n")
+        txn.discard("hard", t.id, force=True)
+
+    def test_idempotent_write_torn_mid_commit_still_rolls_forward(self):
+        # the staged content equals the current content (pre == new): the applied entry holds "both"
+        self.cur.write_text("SAME\n")
+        t = txn.Transaction("hard")
+        t.stage(self.cur, "SAME\n")
+        t.stage(self.nxt, "NEXT-AFTER\n")
+        t._record("PREPARED")
+        t._record("COMMITTING")
+        os.replace(t.entries[0]["staged"], t.entries[0]["target"])
+        self.assertEqual(txn.inspect("hard")[0]["resolution"], "ROLL_FORWARD")
+        self.assertEqual(txn.repair("hard")[0][1], "ROLLED_FORWARD")
+        self.assertEqual(self.nxt.read_text(), "NEXT-AFTER\n")
+
+    def test_prepared_with_changed_target_rolls_back_safely(self):
+        t = txn.Transaction("hard")
+        t.stage(self.nxt, "STALE\n")
+        t._record("PREPARED")
+        self.nxt.write_text("NEWER\n")
+        self.assertEqual(txn.inspect("hard")[0]["resolution"], "ROLL_BACK")
+        self.assertEqual(txn.repair("hard")[0][1], "ROLLED_BACK")
+        self.assertEqual(self.nxt.read_text(), "NEWER\n")
+        self.assertEqual(txn.pending("hard"), [])
+
+    def test_malformed_records_never_crash_and_can_be_discarded(self):
+        d = self.p / ".txn"
+        (d / "bad-list.json").write_text("[]")
+        (d / "bad-entry.json").write_text(json.dumps({"state": "COMMITTING", "entries": [{"target": "x"}]}))
+        for args in (("txn", "hard"), ("txn", "hard", "--repair"), ("doctor", "--no-repo", "--slug", "hard")):
+            r = run(*args)
+            self.assertNotIn("Traceback", r.stderr, args)
+        self.assertEqual(run("txn", "hard").returncode, core.EXIT_RECOVERY_REQUIRED)
+        self.assertEqual({t["resolution"] for t in txn.inspect("hard")}, {"MANUAL_CORRUPT_RECORD"})
+        r = run("begin", "hard", "--agent", "other", "--task", "malformed txn")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.close_all()
+        for rid in ("bad-list", "bad-entry"):
+            self.assertEqual(run("txn", "hard", "--discard", rid).returncode, 0)
+        self.assertEqual(txn.pending("hard"), [])
+
+    def test_register_update_respects_pending_transactions_and_lock(self):
+        t = self._torn_write_current()
+        man = (self.p / "project.json").read_bytes()
+        r = run("register", "hard", "--name", "Renamed", "--repo", str(self.repo), "--update")
+        self.assertEqual(r.returncode, core.EXIT_RECOVERY_REQUIRED, r.stderr)
+        self.assertEqual((self.p / "project.json").read_bytes(), man)
+        self.assertEqual(txn.inspect("hard")[0]["resolution"], "ROLL_FORWARD", "register must not turn repair into MANUAL")
+        txn.repair("hard")
+        with core.project_write_lock("hard"):
+            r = subprocess.run([sys.executable, str(AIMEM), "register", "hard", "--name", "R", "--repo", str(self.repo), "--update"],
+                               capture_output=True, text=True, timeout=60,
+                               env=dict(os.environ, AI_MEMORY_ROOT=str(core.ROOT), PYTHONPATH=str(REPO / "lib")))
+        self.assertIn("LOCK_TIMEOUT", r.stderr) if r.returncode == core.EXIT_LOCK_TIMEOUT else self.assertEqual(r.returncode, 0)
+
+    def test_doctor_repair_reports_post_repair_state(self):
+        self._torn_write_current()
+        r = run("doctor", "--no-repo", "--slug", "hard", "--repair")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("unresolved transaction", r.stdout)
+        self.assertIn("ROLLED_FORWARD", r.stdout)
+
+    def test_migrate_refuses_while_transactions_pending(self):
+        from aimem import migrate
+        t = self._torn_write_current()
+        man = (self.p / "project.json").read_bytes()
+        with self.assertRaises(SystemExit) as cm:
+            migrate.plan_and_apply()
+        self.assertEqual(cm.exception.code, core.EXIT_RECOVERY_REQUIRED)
+        self.assertEqual((self.p / "project.json").read_bytes(), man)
+        txn.repair("hard")
+
+    def test_version_build_suffixes_are_never_downgraded(self):
+        for v in ("4.3.0", "5", "4.2.0+hotfix2", "4.2.0rc1", "4.2.0.1", "garbage", ""):
+            self.assertTrue(core.version_not_older(v, "4.2.0"), v)
+        for v in ("4.1.0", "V3.1.1", "2.0.0+V3.1.1", "4.2"):
+            self.assertFalse(core.version_not_older(v, "4.2.0"), v)
+
+
+class TestIndexReviewFindings(Base):
+    def test_walk_survives_directories_vanishing(self):
+        from aimem import index
+        root = _isolation.SANDBOX / "walk"
+        shutil.rmtree(root, ignore_errors=True)
+        for d in ("a", "b", "c"):
+            (root / d).mkdir(parents=True)
+            for i in range(5):
+                (root / d / f"{i}.md").write_text("x")
+        gen = index._walk_files(root)
+        first = next(gen)
+        shutil.rmtree(root / "b")
+        rest = list(gen)
+        self.assertTrue(first.exists())
+        self.assertFalse([f for f in rest if "/b/" in str(f)])
+        shutil.rmtree(root)
+
+    def test_recovery_never_blocks_behind_index_lock(self):
+        import time
+        from aimem import index
+        run("note", "hard", "--kind", "decision", "--text", "choose ocelotplan", check=True)
+        index.reindex(None, quiet=True, full=True)
+        for suf in ("-wal", "-shm"):
+            Path(str(core.DB) + suf).unlink(missing_ok=True)
+        core.DB.write_bytes(b"garbage" * 5000)
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import time\nfrom aimem import core\nwith core.lock('index', timeout=5):\n"
+                                   "    print('HELD', flush=True)\n    time.sleep(60)"],
+                                  stdout=subprocess.PIPE, text=True,
+                                  env=dict(os.environ, AI_MEMORY_ROOT=str(core.ROOT), PYTHONPATH=str(REPO / "lib")))
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "HELD")
+            t0 = time.time()
+            r = run("begin", "hard", "--agent", "other", "--task", "ocelotplan while index busy")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertLess(time.time() - t0, 40)
+        finally:
+            holder.kill()
+            holder.wait()
+        self.close_all() if hasattr(self, "close_all") else None
+        run("doctor", "--no-repo", "--slug", "hard", "--repair")
+        self.assertEqual(index.db_health(), index.DB_OK)
+
+    def test_doctor_never_quarantines_an_index_healed_concurrently(self):
+        from unittest import mock
+        from aimem import doctor, index
+        index.reindex(None, quiet=True, full=True)
+        q_before = sorted(core.DB.parent.glob("memory.db.corrupt-*"))
+        real = index.db_health
+        calls = {"n": 0}
+
+        def health():
+            calls["n"] += 1
+            return "CORRUPT:simulated" if calls["n"] == 1 else real()  # healed before doctor takes the lock
+        with mock.patch.object(index, "db_health", side_effect=health):
+            _e, _w, info = doctor.run(check_repo=False, repair=True, slug_filter="hard")
+        self.assertEqual(sorted(core.DB.parent.glob("memory.db.corrupt-*")), q_before)
+        self.assertIn("memory.db already healthy (healed concurrently)", info)
+
+    def test_missing_index_table_is_detected_and_repaired(self):
+        from aimem import index
+        index.reindex(None, quiet=True, full=True)
+        with core.lock("index"):
+            con = index.db_connect()
+            con.execute("DROP TABLE chunks_fts")
+            con.commit()
+            con.close()
+        self.assertTrue(index.db_is_broken(index.db_health()))
+        r = run("doctor", "--no-repo", "--slug", "hard")
+        self.assertIn("schema missing table(s) chunks_fts", r.stdout)
+        self.assertEqual(run("doctor", "--no-repo", "--slug", "hard", "--repair").returncode, 0)
+        self.assertEqual(index.db_health(), index.DB_OK)
 
 
 if __name__ == "__main__":

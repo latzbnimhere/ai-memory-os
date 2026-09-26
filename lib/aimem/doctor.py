@@ -292,13 +292,21 @@ def run(deep=False, check_repo=True, repair=False, slug_filter=None):
         for slug in slugs:
             for rid, action in txn.repair(slug):
                 info.append(f"{slug}: txn {rid} -> {action}")
+            # report the state AFTER repair: resolved transactions are no longer errors, manual ones still are
+            errors = [e for e in errors if not e.startswith(f"{slug}: unresolved transaction ")]
+            for t in txn.inspect(slug):
+                errors.append(f"{slug}: unresolved transaction {t['id']} state={t['state']} resolution={t['resolution']}")
         if index.db_is_broken(dbh) or dbh == index.DB_MISSING:
-            if index.db_is_broken(dbh):
-                with core.lock("index", timeout=120):
-                    index._quarantine_db(dbh.splitlines()[0][:200])
-            index.reindex(None, quiet=True, full=True)
+            with core.lock("index", timeout=120):
+                # re-check under the lock: a concurrent search/reindex may already have healed it, and a
+                # healthy index must never be quarantined
+                now = index.db_health()
+                if index.db_is_broken(now):
+                    index._quarantine_db(now.splitlines()[0][:200])
+            if index.db_is_broken(now) or now == index.DB_MISSING:
+                index.reindex(None, quiet=True, full=True)
             after = index.db_health()
-            info.append(f"memory.db rebuilt (health {after})")
+            info.append(f"memory.db rebuilt (health {after})" if now != index.DB_OK else "memory.db already healthy (healed concurrently)")
             if after == index.DB_OK:
                 errors = [e for e in errors if not e.startswith("memory.db")]
     return errors, warnings, info

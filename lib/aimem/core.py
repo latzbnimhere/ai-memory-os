@@ -355,6 +355,24 @@ def version_tuple(v):
     return tuple(int(x or 0) for x in m.groups())
 
 
+def version_not_older(v, engine=None):
+    """True when version string v must NOT be rewritten by this engine: unparseable, numerically newer,
+    or the same numeric version carrying anything extra (a 4th component, "+build", "rc1", ...) --
+    a different build of the same version is never "downgraded" to the plain engine version."""
+    import re as _re
+    engine = engine or VERSION
+    m = _re.match(r"^\s*v?(\d+(?:\.\d+){0,3})(.*)$", str(v or ""), _re.IGNORECASE)
+    e = _re.match(r"^\s*v?(\d+(?:\.\d+){0,3})", engine)
+    if not m or not e:
+        return True
+    num = tuple(int(x) for x in m.group(1).split("."))
+    eng = tuple(int(x) for x in e.group(1).split("."))
+    pad = lambda t: t + (0,) * (4 - len(t))
+    if pad(num) != pad(eng):
+        return pad(num) > pad(eng)
+    return bool(m.group(2).strip()) or len(num) > len(eng)
+
+
 def installed_version():
     v = ROOT / "VERSION"
     if v.exists():
@@ -533,8 +551,11 @@ def recursive_index_risk(repo_path):
 
 
 def git_cmd(repo: Path, args, timeout=10):
+    """Read-only git query. GIT_OPTIONAL_LOCKS=0 stops `git status` from taking .git/index.lock (and
+    touching .git), so observing a project repo never contends with, or modifies, the user's work."""
     try:
-        r = subprocess.run(["git", "-C", str(repo)] + list(args), text=True, capture_output=True, timeout=timeout)
+        env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+        r = subprocess.run(["git", "-C", str(repo)] + list(args), text=True, capture_output=True, timeout=timeout, env=env)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
     except Exception as e:
         return 127, "", str(e)

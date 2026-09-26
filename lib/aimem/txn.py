@@ -53,6 +53,10 @@ class Transaction:
     # -- staging
     def stage(self, target: Path, text: str, validate=None):
         target = Path(target)
+        base = project_dir(self.slug)
+        rel = os.path.relpath(str(target), str(base))
+        if os.path.isabs(rel) or rel == ".." or rel.startswith(".." + os.sep):
+            core.die(f"transaction target outside project {self.slug}: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
         staged = target.parent / f".{target.name}.{self.id}.staged"
         with staged.open("w", encoding="utf-8") as f:
@@ -65,6 +69,10 @@ class Transaction:
         self.entries.append({
             "target": str(target),
             "staged": str(staged),
+            # project-relative paths: repair resolves these against the CURRENT root, so a moved or
+            # copied memory root can never be repaired by writing into the original location
+            "target_rel": rel,
+            "staged_rel": os.path.relpath(str(staged), str(base)),
             "pre_sha256": pre,
             "new_sha256": sha256_file(staged),
             "validate": "json" if validate is core.validate_json_file else None,
@@ -122,24 +130,53 @@ def _finalize(slug, record_path: Path):
         pass
 
 
+def _load_record(f):
+    """Parse one record; anything structurally unusable is a CORRUPT_RECORD (never a crash)."""
+    rec = core.try_load_json(f, None)
+    ok = isinstance(rec, dict) and isinstance(rec.get("entries", []), list) and all(
+        isinstance(e, dict) and isinstance(e.get("target"), str) and isinstance(e.get("staged"), str)
+        for e in rec.get("entries", []))
+    if not ok:
+        return {"id": f.stem, "state": "CORRUPT_RECORD", "path": str(f), "entries": []}
+    rec.setdefault("id", f.stem)
+    rec["path"] = str(f)
+    return rec
+
+
 def pending(slug):
     d = txn_dir(slug)
     if not d.exists():
         return []
-    out = []
-    for f in sorted(d.glob("*.json")):
-        rec = core.try_load_json(f, None)
-        if rec is None:
-            out.append({"id": f.stem, "state": "CORRUPT_RECORD", "path": str(f), "entries": []})
-        else:
-            rec["path"] = str(f)
-            out.append(rec)
-    return out
+    return [_load_record(f) for f in sorted(d.glob("*.json"))]
 
 
-def _target_state(e):
+def _within(path, base):
+    try:
+        Path(path).resolve().relative_to(Path(base).resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def entry_paths(slug, e):
+    """(target, staged) for a record entry, resolved against the CURRENT project dir, or None if unsafe.
+
+    Records written by 4.2+ carry project-relative paths. Legacy records only have absolute paths;
+    those are accepted only while they still point inside this project (a moved/copied root fails
+    closed instead of repairing the original location)."""
+    base = project_dir(slug)
+    if e.get("target_rel") and e.get("staged_rel"):
+        t, st = base / e["target_rel"], base / e["staged_rel"]
+    else:
+        t, st = Path(e["target"]), Path(e["staged"])
+    if not (_within(t, base) and _within(st, base)):
+        return None
+    return t, st
+
+
+def _target_state(e, target=None):
     """'PRE' if target still holds its pre-image, 'NEW' if it already holds the new content, else 'CHANGED'."""
-    t = Path(e["target"])
+    t = Path(target if target is not None else e["target"])
     cur = sha256_file(t) if t.exists() else None
     if cur == e.get("pre_sha256"):
         return "PRE"
@@ -148,105 +185,151 @@ def _target_state(e):
     return "CHANGED"
 
 
+def _holds(target, sha):
+    """True when target currently holds content with this sha256 (None means: target must not exist)."""
+    t = Path(target)
+    return (sha256_file(t) if t.exists() else None) == sha
+
+
+def _staged_valid(e, staged):
+    try:
+        if e.get("validate") == "json":
+            core.validate_json_file(Path(staged))
+        return sha256_file(staged) == e.get("new_sha256")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def classify(slug, rec):
+    """Single source of truth for inspect() and repair(). Returns (resolution, detail dict).
+
+    Resolutions: ROLL_FORWARD, ROLL_BACK, FINALIZE, or MANUAL_* (never applied automatically).
+      PREPARED   nothing was applied: roll forward only if every staged file is intact and every target
+                 still holds its pre-image; otherwise roll back (safe: discards only unapplied content).
+      COMMITTING partially applied: every entry must be consistent -- staged present => target still PRE
+                 and staged intact; staged missing => target holds exactly the new content. Anything
+                 else means someone changed a target since the crash: MANUAL.
+      COMMITTED  all applied: finalize (drop the record).
+    """
+    state = rec.get("state")
+    if state == "CORRUPT_RECORD":
+        return "MANUAL_CORRUPT_RECORD", {}
+    entries = rec.get("entries", [])
+    resolved = [entry_paths(slug, e) for e in entries]
+    if any(r is None for r in resolved):
+        return "MANUAL_PATHS_OUTSIDE_PROJECT", {}
+    present = [(e, t, st) for e, (t, st) in zip(entries, resolved) if st.exists()]
+    missing = [(e, t, st) for e, (t, st) in zip(entries, resolved) if not st.exists()]
+    detail = {"staged_present": len(present), "never_applied": [str(t) for _e, t, _st in present],
+              "applied": [str(t) for _e, t, _st in missing]}
+    if state == "COMMITTED":
+        return "FINALIZE", detail
+    if state == "PREPARED":
+        if (entries and not missing and all(_holds(t, e.get("pre_sha256")) for e, t, _ in present)
+                and all(_staged_valid(e, st) for e, _t, st in present)):
+            return "ROLL_FORWARD", detail
+        detail["applied"] = []  # PREPARED never replaced anything
+        return "ROLL_BACK", detail
+    if state == "COMMITTING":
+        # compare each entry with the exact hash it must hold (pre-image may equal the new content)
+        changed = [str(t) for e, t, _ in present if not _holds(t, e.get("pre_sha256"))] + \
+                  [str(t) for e, t, _ in missing if not _holds(t, e.get("new_sha256"))]
+        if changed:
+            detail["targets_changed_since_prepare"] = changed
+            return "MANUAL_TARGET_CHANGED", detail
+        if not all(_staged_valid(e, st) for e, _t, st in present):
+            return "MANUAL_STAGED_INVALID", detail
+        return "ROLL_FORWARD", detail
+    return "MANUAL_UNKNOWN_STATE", detail
+
+
 def inspect(slug):
     """Read-only classification of pending transactions."""
     report = []
     for rec in pending(slug):
-        state = rec.get("state")
-        entries = rec.get("entries", [])
-        staged_present = [e for e in entries if os.path.exists(e["staged"])]
-        item = {"id": rec.get("id"), "state": state, "kind": rec.get("kind"), "session": rec.get("session"),
-                "targets": [e["target"] for e in entries], "staged_present": len(staged_present), "path": rec.get("path")}
-        changed = [e["target"] for e in staged_present if _target_state(e) == "CHANGED"]
-        if changed:
-            item["targets_changed_since_prepare"] = changed
-        if state == "PREPARED":
-            if not (len(staged_present) == len(entries) and entries):
-                item["resolution"] = "ROLL_BACK"
-            else:
-                item["resolution"] = "MANUAL_TARGET_CHANGED" if changed else "ROLL_FORWARD"
-        elif state == "COMMITTING":
-            item["resolution"] = "MANUAL_TARGET_CHANGED" if changed else "ROLL_FORWARD"
-        elif state == "COMMITTED":
-            item["resolution"] = "FINALIZE"
-        else:
-            item["resolution"] = "MANUAL"
+        resolution, detail = classify(slug, rec)
+        item = {"id": rec.get("id"), "state": rec.get("state"), "kind": rec.get("kind"), "session": rec.get("session"),
+                "targets": [e.get("target") for e in rec.get("entries", [])], "path": rec.get("path"),
+                "resolution": resolution, "staged_present": detail.get("staged_present", 0)}
+        if detail.get("targets_changed_since_prepare"):
+            item["targets_changed_since_prepare"] = detail["targets_changed_since_prepare"]
         report.append(item)
     return report
 
 
+_MANUAL_ACTIONS = {
+    "MANUAL_CORRUPT_RECORD": "LEFT_FOR_MANUAL_REVIEW",
+    "MANUAL_PATHS_OUTSIDE_PROJECT": "PATHS_OUTSIDE_PROJECT_MANUAL_REVIEW",
+    "MANUAL_TARGET_CHANGED": "TARGET_CHANGED_SINCE_PREPARE_MANUAL_REVIEW",
+    "MANUAL_STAGED_INVALID": "STAGED_CONTENT_INVALID_MANUAL_REVIEW",
+    "MANUAL_UNKNOWN_STATE": "UNKNOWN_STATE_MANUAL_REVIEW",
+}
+
+
 def repair(slug):
-    """Apply deterministic recovery. Returns list of (id, action)."""
+    """Apply deterministic recovery. Returns list of (id, action); actions containing MANUAL need a human."""
     actions = []
     with core.project_write_lock(slug):
         for rec in pending(slug):
             rid = rec.get("id")
-            state = rec.get("state")
-            entries = rec.get("entries", [])
             path = Path(rec.get("path"))
-            if state == "CORRUPT_RECORD":
-                actions.append((rid, "LEFT_FOR_MANUAL_REVIEW"))
+            resolution, _detail = classify(slug, rec)
+            if resolution in _MANUAL_ACTIONS:
+                actions.append((rid, _MANUAL_ACTIONS[resolution]))
                 continue
-            present = [e for e in entries if os.path.exists(e["staged"])]
-            if state == "PREPARED" and (len(present) != len(entries) or not entries):
-                for e in entries:
-                    if os.path.exists(e["staged"]):
-                        os.unlink(e["staged"])
+            pairs = [entry_paths(slug, e) for e in rec.get("entries", [])]
+            if resolution == "ROLL_BACK":
+                for _t, st in pairs:
+                    if st.exists():
+                        st.unlink()
                 path.unlink()
                 actions.append((rid, "ROLLED_BACK"))
-                continue
-            if state in ("PREPARED", "COMMITTING"):
-                ok = True
-                for e in present:
-                    try:
-                        if e.get("validate") == "json":
-                            core.validate_json_file(Path(e["staged"]))
-                        if sha256_file(e["staged"]) != e.get("new_sha256"):
-                            ok = False
-                    except Exception:
-                        ok = False
-                if not ok:
-                    actions.append((rid, "STAGED_CONTENT_INVALID_MANUAL_REVIEW"))
-                    continue
-                if any(_target_state(e) == "CHANGED" for e in present):
-                    # Newer content was written over a target after the interruption; applying the
-                    # stale staged copy would destroy it. Leave everything in place for a human.
-                    actions.append((rid, "TARGET_CHANGED_SINCE_PREPARE_MANUAL_REVIEW"))
-                    continue
-                for e in present:
-                    os.replace(e["staged"], e["target"])
-                    core._fsync_dir(Path(e["target"]).parent)
+            elif resolution == "ROLL_FORWARD":
+                for t, st in pairs:
+                    if st.exists():
+                        os.replace(st, t)
+                        core._fsync_dir(t.parent)
                 _finalize(slug, path)
                 actions.append((rid, "ROLLED_FORWARD"))
-                continue
-            if state == "COMMITTED":
+            elif resolution == "FINALIZE":
                 _finalize(slug, path)
                 actions.append((rid, "FINALIZED"))
-                continue
-            actions.append((rid, "UNKNOWN_STATE_MANUAL_REVIEW"))
     return actions
 
 
-def discard(slug, txid):
-    """Explicit human decision to abandon one pending transaction: delete its staged files and record.
+def discard(slug, txid, force=False):
+    """Explicit human decision to abandon one pending transaction. Never automatic, never destructive:
+    the record and every staged file are MOVED to cold/quarantine/txn-<id>/ (not deleted).
 
-    Targets already replaced by a COMMITTING transaction are NOT reverted (their pre-images are
-    gone); they are reported so the operator can check them. Never automatic.
-    """
+    A transaction that `txn --repair` would cleanly roll forward is refused unless force=True, because
+    discarding it drops content that was never applied. Targets a COMMITTING transaction had already
+    replaced are not reverted; both lists are returned so the operator can check them."""
     with core.project_write_lock(slug):
         for rec in pending(slug):
             if rec.get("id") != txid:
                 continue
-            entries = rec.get("entries", [])
-            applied = [e["target"] for e in entries if not os.path.exists(e.get("staged", ""))]
-            for e in entries:
-                if os.path.exists(e.get("staged", "")):
-                    os.unlink(e["staged"])
-            Path(rec["path"]).unlink()
+            resolution, detail = classify(slug, rec)
+            if resolution == "ROLL_FORWARD" and not force:
+                core.die(f"REFUSED: transaction {txid} can be rolled forward cleanly (`aimem txn {slug} --repair`). "
+                         "Discarding it would drop content that was never applied; pass --force to discard anyway.")
+            qdir = project_dir(slug) / "cold" / "quarantine" / f"txn-{txid}"
+            qdir.mkdir(parents=True, exist_ok=True)
+            moved = []
+            for e in rec.get("entries", []):
+                pair = entry_paths(slug, e)
+                if pair and pair[1].exists():
+                    dst = qdir / pair[1].name
+                    os.replace(pair[1], dst)
+                    moved.append(str(dst))
+            os.replace(rec["path"], qdir / Path(rec["path"]).name)
+            core._fsync_dir(qdir)
+            info = {"previous_state": rec.get("state"), "resolution": resolution, "quarantine": str(qdir),
+                    "never_applied": detail.get("never_applied", []), "already_applied": detail.get("applied", []),
+                    "moved": moved}
             core.append_jsonl(project_dir(slug) / "cold" / "txn-journal" / f"{core.day()}.jsonl", {
-                "time": iso(), "txn": txid, "state": "DISCARDED", "previous_state": rec.get("state"),
-                "already_applied_targets": [Path(t).name for t in applied] if rec.get("state") != "PREPARED" else []})
-            return rec.get("state"), (applied if rec.get("state") != "PREPARED" else [])
+                "time": iso(), "txn": txid, "state": "DISCARDED", "forced": bool(force),
+                **{k: ([Path(x).name for x in v] if isinstance(v, list) else v) for k, v in info.items()}})
+            return info
     core.die(f"No pending transaction {txid} for {slug}")
 
 

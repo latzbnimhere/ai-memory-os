@@ -80,12 +80,17 @@ def cmd_register(a):
     reg["projects"][slug] = {"name": a.name or slug, "path": str(p), "repo": repo}
     for sub in ("checkpoints", "knowledge", "artifacts", "cold/step-journal", "sessions", ".generated", ".txn"):
         (p / sub).mkdir(parents=True, exist_ok=True)
-    man = core.try_load_json(p / "project.json", {}) or {}
-    man.update({"slug": slug, "name": a.name or man.get("name") or slug, "repo": repo, "updated_at": iso(), "engine_version": core.VERSION})
-    man.setdefault("created_at", iso())
-    man.setdefault("current_checkpoint", None)
-    man.setdefault("memory_version", 0)
-    atomic_write_json(p / "project.json", man)
+    from . import txn
+    with core.project_write_lock(slug):
+        # project.json is canonical (memory_version, current_checkpoint): read-modify-write under the write
+        # lock, and never while an interrupted transaction may still roll project.json forward.
+        txn.require_no_pending(slug)
+        man = core.try_load_json(p / "project.json", {}) or {}
+        man.update({"slug": slug, "name": a.name or man.get("name") or slug, "repo": repo, "updated_at": iso(), "engine_version": core.VERSION})
+        man.setdefault("created_at", iso())
+        man.setdefault("current_checkpoint", None)
+        man.setdefault("memory_version", 0)
+        atomic_write_json(p / "project.json", man)
     for f in ("DECISIONS.jsonl", "EVENTS.jsonl", "ARTIFACTS.jsonl", "PROVENANCE.jsonl"):
         (p / f).touch()
     tmpl = ROOT / "templates"
@@ -243,25 +248,31 @@ def cmd_txn(a):
     if a.discard:
         if not a.slug:
             die("--discard requires an explicit project slug")
-        state, applied = txn.discard(a.slug, a.discard)
-        print(f"TXN_DISCARDED={a.discard} previous_state={state}")
-        for t in applied:
+        info = txn.discard(a.slug, a.discard, force=a.force)
+        print(f"TXN_DISCARDED={a.discard} previous_state={info['previous_state']} resolution={info['resolution']}")
+        print(f"QUARANTINED_TO={info['quarantine']}")
+        for t in info["never_applied"]:
+            print(f"NEVER_APPLIED={t} (its staged content is preserved in the quarantine dir)")
+        for t in info["already_applied"]:
             print(f"ALREADY_APPLIED_NOT_REVERTED={t} (verify this file)")
         return
     slugs = [a.slug] if a.slug else core.all_slugs()
     total = 0
+    manual = 0
     for slug in slugs:
         if a.repair:
             for rid, action in txn.repair(slug):
                 print(f"{slug}\t{rid}\t{action}")
                 total += 1
+                manual += "MANUAL" in action
         else:
             for t in txn.inspect(slug):
                 total += 1
                 print(f"{slug}\t{t['id']}\tstate={t['state']}\tresolution={t['resolution']}\ttargets={[Path(x).name for x in t['targets']]}")
     if not total:
         print("NO_PENDING_TRANSACTIONS")
-    elif not a.repair:
+    elif not a.repair or manual:
+        # still pending (inspection only, or repair left transactions for a human): writes stay blocked
         raise SystemExit(core.EXIT_RECOVERY_REQUIRED)
 
 
@@ -583,7 +594,7 @@ def build_parser():
     p = sp.add_parser("sessions"); p.add_argument("slug", nargs="?"); p.add_argument("--open", action="store_true"); p.set_defaults(func=cmd_sessions)
     p = sp.add_parser("session"); p.add_argument("action", choices=["close", "show"]); p.add_argument("slug"); p.add_argument("--session"); p.add_argument("--result", default="ABANDONED"); p.add_argument("--note"); p.set_defaults(func=cmd_session)
     p = sp.add_parser("write-current", help="transactional CAS write of CURRENT.md/NEXT.md from files"); p.add_argument("slug"); p.add_argument("--current"); p.add_argument("--next"); p.add_argument("--session"); p.add_argument("--expect-version", type=int); p.add_argument("--allow-secret-pattern", action="store_true"); p.set_defaults(func=cmd_write_current)
-    p = sp.add_parser("txn"); p.add_argument("slug", nargs="?"); g = p.add_mutually_exclusive_group(); g.add_argument("--repair", action="store_true"); g.add_argument("--discard", metavar="TXID", help="abandon one pending transaction after manual review (never automatic)"); p.set_defaults(func=cmd_txn)
+    p = sp.add_parser("txn"); p.add_argument("slug", nargs="?"); g = p.add_mutually_exclusive_group(); g.add_argument("--repair", action="store_true"); g.add_argument("--discard", metavar="TXID", help="abandon one pending transaction after manual review (quarantined, never automatic)"); p.add_argument("--force", action="store_true", help="with --discard: also discard a transaction that could be rolled forward cleanly"); p.set_defaults(func=cmd_txn)
 
     p = sp.add_parser("recover"); p.add_argument("slug", nargs="?"); p.add_argument("--session"); p.set_defaults(func=cmd_recover)
     p = sp.add_parser("reconcile"); p.add_argument("slug"); p.set_defaults(func=cmd_reconcile)

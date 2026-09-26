@@ -207,20 +207,30 @@ def classify_path(rel: Path):
     return "project_text"
 
 
+def _walk_files(root):
+    """Sorted regular files under root. Tolerates entries vanishing mid-walk (a concurrent rmtree of a
+    refused checkpoint, a manual archive) instead of raising; never descends into symlinked dirs
+    (same as the previous rglob) or into ignored/session trees."""
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _e: None):
+        rel = Path(dirpath).relative_to(root).parts
+        dirnames[:] = sorted(d for d in dirnames if d not in GENERATED_IGNORE and not (not rel and d == "sessions"))
+        for fn in sorted(filenames):
+            f = Path(dirpath) / fn
+            try:
+                if f.is_file():
+                    yield f
+            except OSError:
+                continue
+
+
 def iter_index_files(slug=None):
     cfg = config()
     roots = [(slug, project_dir(slug))] if slug else [(s, project_dir(s)) for s in sorted(registry()["projects"])]
     for s, root in roots:
         if not root.exists():
             continue
-        for f in sorted(root.rglob("*")):
-            if not f.is_file():
-                continue
+        for f in _walk_files(root):
             parts = f.relative_to(root).parts
-            if any(part in GENERATED_IGNORE for part in parts):
-                continue
-            if parts and parts[0] == "sessions":
-                continue  # session state/steps are retrieved through session commands, not free-text search
             if f.name.startswith(".") or f.name.endswith(".staged"):
                 continue
             if f.suffix.lower() not in TEXT_EXTS:
@@ -352,7 +362,7 @@ def reindex(slug=None, quiet=False, full=False, best_effort=False):
                 _quarantine_db(str(e))
                 _locked_refresh(None, full=True)
                 files, chunks, changed, removed = _locked_refresh(slug)
-        except sqlite3.Error as e:
+        except (sqlite3.Error, OSError) as e:
             if not best_effort:
                 raise
             print(f"WARN: INDEX_REFRESH_DEFERRED ({type(e).__name__}: {e}); canonical state is committed",
@@ -436,15 +446,25 @@ def fts_search(slug, query, limit=12, refresh=True):
 
 
 def _recover_and_query(slug, match, limit, err):
-    """Corrupt derived index: quarantine (never delete), rebuild from canonical files, retry once."""
+    """Corrupt derived index: quarantine (never delete), rebuild from canonical files, retry once.
+
+    Never blocks begin/search behind another process: if the index lock is busy (someone else is
+    probably rebuilding it), return no retrieval results now; the canonical sections of the context
+    are unaffected and `aimem doctor` reports whatever damage remains."""
     try:
-        reindex(None, quiet=True, full=True)  # reindex quarantines on corruption itself
-        if db_is_broken(db_health()):  # damage the rebuild did not touch (e.g. free pages)
-            with core.lock("index", timeout=120):
-                _quarantine_db(str(err))
-                _locked_refresh(None, full=True)
+        with core.lock("index", timeout=5, required=False) as got:
+            if not got:
+                print("WARN: search index damaged and busy; retrieval skipped for this call", file=sys.stderr)
+                return []
+            try:
+                return _query(slug, match, limit)  # healed concurrently while we waited for the lock?
+            except sqlite3.DatabaseError as e:
+                if not is_corruption_error(e):
+                    return []
+            _quarantine_db(str(err))
+            _locked_refresh(None, full=True)
         return _query(slug, match, limit)
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError):
         return []  # never crash begin/search on a derived index; doctor reports what is left
 
 
@@ -456,7 +476,13 @@ def db_health():
     con = None
     try:
         con = sqlite3.connect(str(DB), timeout=30)
-        return classify_integrity(rows=con.execute("PRAGMA integrity_check(20)").fetchall())
+        status = classify_integrity(rows=con.execute("PRAGMA integrity_check(20)").fetchall())
+        if status == DB_OK and con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+            names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            missing = [t for t in ("chunks_fts", "chunks_meta", "files") if t not in names]
+            if missing:
+                return f"CORRUPT:schema missing table(s) {', '.join(missing)}"
+        return status
     except Exception as e:  # noqa: BLE001 - any failure to even check is a classified result, never a crash
         return classify_integrity(exc=e)
     finally:
