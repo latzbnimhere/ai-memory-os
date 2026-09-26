@@ -166,10 +166,17 @@ def import_packet(slug, packet_path, dry_run=False, note="", session=None):
                "- Update CURRENT.md manually only after verifying claims locally."]
     report_text = "\n".join(report) + "\n"
     result = {"status": status, "sha256": sha, "conflicts": conflicts, "warnings": warnings, "matches": matches, "dry_run": dry_run}
-    if dry_run:
-        rp = p / ".generated" / f"CHAT-IMPORT-DRYRUN-{stamp()}.md"
+    if dry_run or secrets:
+        # A packet with credential patterns is never persisted (not in knowledge/, not in objects/, not
+        # indexed): memory would otherwise keep and re-serve the secret forever. Only the report is written.
+        rp = p / ".generated" / f"CHAT-IMPORT-{'DRYRUN' if dry_run else 'REFUSED'}-{stamp()}.md"
         core.atomic_write(rp, report_text)
         result["report"] = str(rp)
+        if secrets and not dry_run:
+            result["status"] = "REFUSED_SECRET_PATTERN"
+            core.append_jsonl(p / "EVENTS.jsonl", {"time": iso(), "kind": "chat_import_refused", "source_path": str(src),
+                                                    "sha256": sha, "reason": "secret pattern in packet", "patterns": secrets,
+                                                    "session_id": session})
         return result
     # persist evidence verbatim
     osha, opath, dedup = objects.store_text(text)

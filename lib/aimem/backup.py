@@ -28,6 +28,39 @@ def sidecar(tar_path, suffix):
     return legacy if legacy.exists() else new
 
 
+def unsafe_members(tf):
+    """Names of tar members that must never be extracted from a backup.
+
+    Allowed: regular files, directories, and symlinks whose (relative) target stays inside
+    AI-Memory/. Refused: absolute paths, '..', members outside AI-Memory/, hardlinks,
+    escaping or absolute symlinks (which could redirect later members outside the
+    extraction target), devices and FIFOs.
+    """
+    import posixpath
+    bad = []
+    for m in tf.getmembers():
+        parts = Path(m.name).parts
+        if m.name.startswith("/") or ".." in parts or not parts or parts[0] != "AI-Memory":
+            bad.append(m.name)
+        elif m.issym():
+            target = posixpath.normpath(posixpath.join(posixpath.dirname(m.name), m.linkname))
+            if m.linkname.startswith("/") or not (target == "AI-Memory" or target.startswith("AI-Memory/")):
+                bad.append(m.name)
+        elif not (m.isfile() or m.isdir()):
+            bad.append(m.name)
+    return bad
+
+
+def safe_extract(tf, dest):
+    bad = unsafe_members(tf)
+    if bad:
+        core.die(f"UNSAFE_BACKUP_MEMBERS: refusing to extract {len(bad)} member(s), e.g. {bad[:3]}")
+    if hasattr(tarfile, "data_filter"):
+        tf.extractall(dest, filter="data")  # defence in depth where the stdlib supports it
+    else:  # pragma: no cover - older Python without extraction filters
+        tf.extractall(dest)
+
+
 def backup_dir():
     d = Path(config().get("backup_dir", str(Path.home() / "AI-Memory-Backups"))).expanduser()
     d.mkdir(parents=True, exist_ok=True)
@@ -139,11 +172,10 @@ def verify(backup_path, keep_temp=False):
     tmp = Path(tempfile.mkdtemp(prefix="aimem-restore-verify-"))
     try:
         with tarfile.open(bp, "r:gz") as tf:
-            for m in tf.getmembers():
-                if m.name.startswith("/") or ".." in Path(m.name).parts:
-                    report["checks"].append(("tar_paths_safe", "FAIL"))
-                    return _finish_verify(bp, report)
-            tf.extractall(tmp)
+            if unsafe_members(tf):
+                report["checks"].append(("tar_paths_safe", "FAIL"))
+                return _finish_verify(bp, report)
+            safe_extract(tf, tmp)
         report["checks"].append(("tar_paths_safe", "PASS"))
         root = tmp / "AI-Memory"
         man = root / "BACKUP_MANIFEST.sha256"
@@ -204,8 +236,11 @@ def restore(backup_path, confirm=False):
     aside = ROOT.parent / f"{ROOT.name}.pre-restore-{stamp()}"
     tmp = Path(tempfile.mkdtemp(prefix="aimem-restore-", dir=str(ROOT.parent)))
     with tarfile.open(bp, "r:gz") as tf:
-        tf.extractall(tmp)
+        safe_extract(tf, tmp)  # re-validated: the file could have changed since verify()
     extracted = tmp / "AI-Memory"
+    if not (extracted / "registry" / "projects.json").exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+        core.die("Restore refused: extracted backup has no registry/projects.json")
     os.rename(ROOT, aside)
     os.rename(extracted, ROOT)
     shutil.rmtree(tmp, ignore_errors=True)

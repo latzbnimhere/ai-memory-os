@@ -339,6 +339,15 @@ def ensure_root():
         d.mkdir(exist_ok=True)
 
 
+def version_tuple(v):
+    """'4.1.0' -> (4, 1, 0); unparseable -> None (callers must treat None as unknown, never as older)."""
+    import re as _re
+    m = _re.match(r"^\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", str(v or ""))
+    if not m:
+        return None
+    return tuple(int(x or 0) for x in m.groups())
+
+
 def installed_version():
     v = ROOT / "VERSION"
     if v.exists():

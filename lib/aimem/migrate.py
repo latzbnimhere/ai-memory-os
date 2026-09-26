@@ -1,4 +1,12 @@
-"""Idempotent V3.1.1 -> V4 layout migration of a memory root (never deletes history)."""
+"""Idempotent V3.1.1 -> V4 layout migration of a memory root (never deletes history).
+
+Safety rules:
+- Never downgrade: if the root, config or any project manifest was written by a NEWER
+  engine (or an unknown future schema), migration refuses before changing anything
+  (dry-run included). Upgrade the engine instead.
+- Only additive changes: missing directories/files/keys are created; nothing is removed.
+- Manifest updates run under the project write lock; session updates under the session lock.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,8 +15,44 @@ from . import core, index, provenance, sessions
 from .core import OBJECTS, ROOT, RUN, atomic_write, atomic_write_json, config, iso, project_dir, registry, try_load_json
 
 
+SUPPORTED_CONFIG_VERSION = 4
+
+
+def future_blockers():
+    """Reasons this engine must not migrate the root (data from a newer engine / unknown schema)."""
+    engine = core.version_tuple(core.VERSION)
+    out = []
+    vf = ROOT / "VERSION"
+    if vf.exists():
+        rv = core.version_tuple(vf.read_text().strip())
+        if rv is None:
+            out.append(f"root VERSION is unparseable: {vf.read_text().strip()[:40]!r}")
+        elif rv > engine:
+            out.append(f"root VERSION {vf.read_text().strip()} is newer than engine {core.VERSION}")
+    cfg = try_load_json(core.CONFIG, {}) or {}
+    cv = cfg.get("version")
+    if cv is not None and (not isinstance(cv, int) or cv > SUPPORTED_CONFIG_VERSION):
+        out.append(f"config.json version {cv!r} is newer than supported {SUPPORTED_CONFIG_VERSION}")
+    for slug in sorted(registry()["projects"]):
+        try:
+            man = try_load_json(project_dir(slug) / "project.json", None)
+        except SystemExit:
+            out.append(f"{slug}: unsafe slug in registry")
+            continue
+        if not man or not man.get("engine_version"):
+            continue
+        pv = core.version_tuple(man["engine_version"])
+        if pv is None or pv > engine:
+            out.append(f"{slug}: project.json engine_version {man['engine_version']} is newer than engine {core.VERSION}")
+    return out
+
+
 def plan_and_apply(dry_run=False):
     core.ensure_root()
+    blockers = future_blockers()
+    if blockers:
+        core.die("MIGRATE_REFUSED_NEWER_DATA: " + "; ".join(blockers[:10]) +
+                 ". This engine will not rewrite data from a newer engine or unknown schema; install the newer engine.")
     actions = []
     reg = registry()
     for d in (OBJECTS / "sha256", RUN):
@@ -26,25 +70,25 @@ def plan_and_apply(dry_run=False):
                 actions.append(f"{slug}: mkdir {sub}")
                 if not dry_run:
                     (p / sub).mkdir(parents=True, exist_ok=True)
-        man = try_load_json(p / "project.json", None)
-        if man is None:
-            actions.append(f"{slug}: ERROR project.json invalid; not migrated")
-            continue
-        changed = False
-        if "memory_version" not in man:
-            man["memory_version"] = 1
-            changed = True
-        if "engine_version" not in man or man.get("engine_version") != core.VERSION:
-            man["engine_version"] = core.VERSION
-            changed = True
-        if "migrated_from" not in man:
-            man["migrated_from"] = "V3.1.1"
-            man["migrated_at"] = iso()
-            changed = True
-        if changed:
-            actions.append(f"{slug}: project.json += memory_version/engine_version/migration provenance")
-            if not dry_run:
-                atomic_write_json(p / "project.json", man)
+        with core.project_write_lock(slug):
+            man = try_load_json(p / "project.json", None)
+            if man is None:
+                actions.append(f"{slug}: ERROR project.json invalid; not migrated")
+                continue
+            changed = []
+            if "memory_version" not in man:
+                # A manifest without memory_version predates V4: record where it came from.
+                man["memory_version"] = 1
+                man.setdefault("migrated_from", "V3.1.1")
+                man.setdefault("migrated_at", iso())
+                changed.append("memory_version+migration provenance")
+            if man.get("engine_version") != core.VERSION:
+                changed.append(f"engine_version {man.get('engine_version')} -> {core.VERSION}")
+                man["engine_version"] = core.VERSION
+            if changed:
+                actions.append(f"{slug}: project.json " + ", ".join(changed))
+                if not dry_run:
+                    atomic_write_json(p / "project.json", man)
         if not (p / "PROVENANCE.jsonl").exists():
             actions.append(f"{slug}: create PROVENANCE.jsonl (seed from REPO_STATE.json + current checkpoint)")
             if not dry_run:
@@ -63,16 +107,20 @@ def plan_and_apply(dry_run=False):
                 actions.append(f"{slug}: session {j.get('id')} += lease (last_heartbeat={hb})")
                 if not dry_run:
                     cfg = config()
-                    j["lease"] = {"state": "MIGRATED", "last_heartbeat": hb, "heartbeats": 0,
-                                  "stale_after_s": cfg["heartbeat_stale_s"], "abandoned_after_s": cfg["heartbeat_abandoned_s"], "migrated": True}
-                    j.setdefault("start_memory_version", 0)
-                    atomic_write_json(f, j)
+                    with core.project_session_lock(slug):
+                        j = try_load_json(f, None) or j
+                        if "lease" not in j:
+                            j["lease"] = {"state": "MIGRATED", "last_heartbeat": hb, "heartbeats": 0,
+                                          "stale_after_s": cfg["heartbeat_stale_s"],
+                                          "abandoned_after_s": cfg["heartbeat_abandoned_s"], "migrated": True}
+                            j.setdefault("start_memory_version", 0)
+                            atomic_write_json(f, j)
     cfg = try_load_json(core.CONFIG, {}) or {}
-    if cfg.get("version") != 4:
+    if cfg.get("version") != SUPPORTED_CONFIG_VERSION:  # only ever older here (newer refused above)
         merged = dict(core.DEFAULT_CONFIG)
         merged.update(cfg)
-        merged["version"] = 4
-        actions.append("config.json -> version 4 (existing keys preserved)")
+        merged["version"] = SUPPORTED_CONFIG_VERSION
+        actions.append(f"config.json -> version {SUPPORTED_CONFIG_VERSION} (existing keys preserved)")
         if not dry_run:
             atomic_write_json(core.CONFIG, merged)
     if (ROOT / "VERSION").read_text().strip() != core.VERSION if (ROOT / "VERSION").exists() else True:

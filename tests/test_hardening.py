@@ -279,5 +279,96 @@ class TestSessionConcurrency(Base):
         self.assertIn(f'"pid": {os.getpid()}', r.stderr)
 
 
+class TestImportBackupMigrate(Base):
+    def test_chat_import_never_persists_secret_packets(self):
+        pkt = _isolation.SANDBOX / "packet.txt"
+        pkt.write_text("AI_MEMORY_AGENT_PACKET BEGIN\nPACKET_VERSION: AI_MEMORY_AGENT_PACKET_V1\nPROJECT_SLUG: hard\n"
+                       "NOTE: leaked " + "sk" + "-" + "Z" * 40 + "\nAI_MEMORY_AGENT_PACKET END\n")
+        r = run("chat-import", "hard", str(pkt))
+        self.assertEqual(r.returncode, core.EXIT_CONFLICT)
+        self.assertIn("REFUSED_SECRET_PATTERN", r.stdout)
+        kdir = self.p / "knowledge" / "chat-imports"
+        self.assertFalse(kdir.exists() and any(kdir.iterdir()))
+        leaked = [f for f in Path(core.ROOT).rglob("*") if f.is_file() and ".generated" not in f.parts
+                  and "Z" * 40 in f.read_text(errors="ignore")]
+        self.assertEqual(leaked, [])
+
+    def _tar(self, name, build):
+        import tarfile
+        t = _isolation.SANDBOX / name
+        with tarfile.open(t, "w:gz") as tf:
+            build(tf)
+        return t
+
+    def test_backup_refuses_escaping_links_but_allows_contained_ones(self):
+        import io
+        import tarfile
+        from aimem import backup
+
+        def add_file(tf, name, data=b"x"):
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+
+        def add_link(tf, name, target, kind=tarfile.SYMTYPE):
+            ti = tarfile.TarInfo(name)
+            ti.type = kind
+            ti.linkname = target
+            tf.addfile(ti)
+
+        evil = self._tar("evil.tar.gz", lambda tf: (add_link(tf, "AI-Memory/escape", "../../outside"),
+                                                     add_file(tf, "AI-Memory/escape/pwned")))
+        evil2 = self._tar("evil2.tar.gz", lambda tf: add_link(tf, "AI-Memory/h", "/etc/passwd", tarfile.LNKTYPE))
+        good = self._tar("good.tar.gz", lambda tf: (add_file(tf, "AI-Memory/registry/projects.json", b"{}"),
+                                                     add_link(tf, "AI-Memory/alias", "registry/projects.json")))
+        for bad in (evil, evil2):
+            with tarfile.open(bad) as tf:
+                self.assertTrue(backup.unsafe_members(tf))
+            rep = backup.verify(bad)
+            self.assertEqual(rep["result"], "FAIL")
+            self.assertIn(("tar_paths_safe", "FAIL"), rep["checks"])
+        with tarfile.open(good) as tf:
+            self.assertEqual(backup.unsafe_members(tf), [])
+        self.assertFalse((_isolation.SANDBOX / "outside").exists())
+
+    def test_migrate_refuses_newer_data_without_mutation(self):
+        from aimem import migrate
+        root = Path(core.ROOT)
+        snap = lambda: {str(f): f.read_bytes() for f in root.rglob("*") if f.is_file() and ".locks" not in f.parts}
+        vfile = root / "VERSION"
+        orig = vfile.read_text()
+        try:
+            vfile.write_text("9.0.0\n")
+            before = snap()
+            with self.assertRaises(SystemExit):
+                migrate.plan_and_apply(dry_run=True)
+            with self.assertRaises(SystemExit):
+                migrate.plan_and_apply()
+            self.assertEqual(snap(), before)
+        finally:
+            vfile.write_text(orig)
+        man = core.project_manifest("hard")
+        try:
+            man2 = dict(man, engine_version="7.0.0")
+            core.atomic_write_json(self.p / "project.json", man2)
+            with self.assertRaises(SystemExit):
+                migrate.plan_and_apply()
+            self.assertEqual(core.project_manifest("hard")["engine_version"], "7.0.0")
+        finally:
+            core.atomic_write_json(self.p / "project.json", man)
+        cfg = core.try_load_json(core.CONFIG, {})
+        try:
+            core.atomic_write_json(core.CONFIG, dict(cfg, version=5))
+            with self.assertRaises(SystemExit):
+                migrate.plan_and_apply()
+            self.assertEqual(core.try_load_json(core.CONFIG, {})["version"], 5)
+        finally:
+            core.atomic_write_json(core.CONFIG, cfg)
+        migrate.plan_and_apply()
+        self.assertNotIn("migrated_from", core.project_manifest("hard"), "native V4 project must not claim V3 origin")
+        plan = migrate.plan_and_apply(dry_run=True)  # idempotent: nothing left to change in manifests
+        self.assertFalse([a for a in plan if "project.json" in a], plan)
+
+
 if __name__ == "__main__":
     unittest.main()
