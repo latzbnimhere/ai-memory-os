@@ -1,6 +1,6 @@
 # AI MEMORY OS V4 — AGENT PROTOCOL
 
-Root: `~/AI-Memory` (canonical, local-only, vendor-neutral). Version: 4.1.0. No API, no cloud, no telemetry.
+Root: `~/AI-Memory` (canonical, local-only, vendor-neutral). Version: 4.2.0. No API, no cloud, no telemetry.
 
 ## 1. Detect and begin
 ```bash

@@ -1,4 +1,4 @@
-# Commands (aimem 4.1.0)
+# Commands (aimem 4.2.0)
 
 Exit codes: 0 ok · 1 warn/fail · 2 error · 3 conflict (CAS) · 4 recovery/transactions required · 5 lock timeout · 6 ambiguous session
 

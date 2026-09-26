@@ -1,4 +1,4 @@
-# AI Memory OS V4.1 (4.1.0)
+# AI Memory OS V4.2 (4.2.0)
 
 Local, vendor-neutral continuation memory for AI coding and operations agents.
 Huge durable history, minimum relevant context. No API, no cloud, no telemetry, $0.

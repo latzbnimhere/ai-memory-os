@@ -266,7 +266,7 @@ class TestSessionConcurrency(Base):
         run("finish", "hard", "--session", sid, "--result", "PASS", check=True)
 
     def test_path_like_pwd_is_not_a_secret(self):
-        self.assertFalse(core.secret_hits_text("pwd=/Users/someone/project"))
+        self.assertFalse(core.secret_hits_text("pwd=/srv/work/project"))
         self.assertTrue(core.secret_hits_text("password=hunter2hunter2"))
 
     def test_lock_timeout_reports_last_holder(self):
@@ -471,6 +471,56 @@ class TestContextAndRetrieval(Base):
         con = index.db_connect()
         self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], index.SCHEMA_VERSION)
         con.close()
+
+
+class TestDoctor(Base):
+    def doctor(self, *extra):
+        return run("doctor", "--deep", "--no-repo", "--slug", "hard", *extra)
+
+    def test_torn_journal_line_detected_and_quarantined_losslessly(self):
+        ev = self.p / "EVENTS.jsonl"
+        core.append_jsonl(ev, {"kind": "before", "n": 1})
+        with ev.open("a") as fh:
+            fh.write('{"kind": "torn", "n": 2, "x')  # crash mid-append
+        core.append_jsonl(ev, {"kind": "after", "n": 3})
+        original = ev.read_bytes()
+        r = self.doctor()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("invalid JSONL EVENTS.jsonl", r.stdout)
+        r = self.doctor("--repair")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("quarantined 1 invalid line(s) from EVENTS.jsonl", r.stdout)
+        kinds = [x.get("kind") for x in core.read_jsonl(ev)]
+        self.assertIn("before", kinds)
+        self.assertIn("after", kinds)
+        q = self.p / "cold" / "quarantine"
+        self.assertEqual(next(q.glob("EVENTS.jsonl.*.orig")).read_bytes(), original)
+        self.assertIn(b'"torn"', next(q.glob("EVENTS.jsonl.*.bad")).read_bytes())
+        self.assertEqual(self.doctor().returncode, 0)
+
+    def test_stale_temp_files_and_incomplete_checkpoints_reported(self):
+        tmp = self.p / ".CURRENT.md.abc123.tmp"
+        tmp.write_text("partial")
+        old = __import__("time").time() - 7200
+        os.utime(tmp, (old, old))
+        inc = self.p / "checkpoints" / "20250101T000000+0000__interrupted"
+        inc.mkdir(parents=True)
+        (inc / "CURRENT.md").write_text("x")
+        legacy = self.p / "checkpoints" / "20250101T000001+0000__refused"
+        legacy.mkdir()
+        (legacy / "CURRENT.md").write_text("y")
+        core.atomic_write_json(legacy / "meta.json", {"id": legacy.name, "engine_version": "4.1.0", "result": "PASS"})
+        try:
+            r = self.doctor()
+            self.assertIn("stale temp file", r.stdout)
+            self.assertIn("incomplete checkpoint 20250101T000000+0000__interrupted", r.stdout)
+            self.assertIn("20250101T000001+0000__refused was never committed", r.stdout)
+            self.doctor("--repair")
+            self.assertFalse(tmp.exists())
+            self.assertTrue(inc.exists(), "doctor must never delete checkpoint data")
+        finally:
+            shutil.rmtree(inc, ignore_errors=True)
+            shutil.rmtree(legacy, ignore_errors=True)
 
 
 if __name__ == "__main__":

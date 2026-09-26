@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Controlled promotion to AI Memory OS 4.1.0 with rehearsal, gates, verification and automatic rollback.
+"""Controlled promotion to the AI Memory OS version in ./VERSION with rehearsal, gates, verification and automatic rollback.
 
   python3 tools/promote.py --rehearse --root /path/to/AI-Memory
   python3 tools/promote.py --live --root /path/to/AI-Memory --confirm-live-root /path/to/AI-Memory --backup-dir D
@@ -8,7 +8,7 @@ Gates (all must pass before any live mutation): zero OPEN sessions on the target
 the backup and again immediately before the first mutation), unit tests on an isolated root, full isolated selftest,
 baseline doctor --deep on the target root, fresh verified backup of the target root. After install: migrate,
 doctor --deep, health, hash verification, functional smoke (begin/step/finish on the ai-memory slug). Any failure after
-the first mutation -> rollback to the preserved pre-4.1.0 files; a failure before it leaves the root untouched.
+the first mutation -> rollback to the preserved pre-promotion files; a failure before it leaves the root untouched.
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 DEV = Path(__file__).resolve().parents[1]
+DEV_VERSION = (DEV / "VERSION").read_text().strip()
 BIN_FILES = ["aimem", "aimem-detect", "aimem-step", "aimem-sweep"]
 SHARE_FILES = ["AI_MEMORY_AGENT_PROTOCOL_V4.md", "AI_MEMORY_AUTOPILOT.md", "AI_MEMORY_CONTINUOUS_JOURNAL.md",
                "OTHER_AI_AGENT_INSTRUCTIONS.md", "SESSION_BINDING_V3_1.md", "AI_PROTOCOL.md"]
@@ -110,14 +111,14 @@ class Promotion:
         self.report["baseline_version"] = out.strip().splitlines()[0] if out else "?"
         self.zero_open_sessions_gate("ZERO_OPEN_SESSIONS_BEFORE_BACKUP")
         # fresh verified backup with the V4 backup module (manifest + isolated restore verify)
-        rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "backup", "--output-dir", str(self.backup_dir), "--label", "pre-4.1.0-promotion", "--verify"], env=self.env)
+        rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "backup", "--output-dir", str(self.backup_dir), "--label", f"pre-{DEV_VERSION}-promotion", "--verify"], env=self.env)
         self.gate("PRE_PROMOTION_BACKUP_VERIFIED", rc == 0 and "BACKUP_VERIFY=PASS" in out, out)
         self.report["pre_promotion_backup"] = next((l.split()[-1] for l in out.splitlines() if l.startswith("BACKUP=PASS")), None)
 
     # ------------------------------------------------------------ install
     def preserve(self):
         stamp = time.strftime("%Y%m%dT%H%M%S%z")
-        keep = self.root / ".previous" / f"pre-4.1.0-{stamp}"
+        keep = self.root / ".previous" / f"pre-{DEV_VERSION}-{stamp}"
         (keep / "bin").mkdir(parents=True)
         for f in BIN_FILES:
             src = self.root / "bin" / f
@@ -144,7 +145,7 @@ class Promotion:
             )
 
         self.preserved = keep
-        self.step("PRESERVE_PRE_4_1_0_FILES", str(keep))
+        self.step("PRESERVE_PRE_PROMOTION_FILES", str(keep))
 
     def install(self):
         for f in BIN_FILES:
@@ -163,7 +164,7 @@ class Promotion:
             shutil.rmtree(docs_dst)
         shutil.copytree(DEV / "docs", docs_dst)
         shutil.copy2(DEV / "README.md", self.root / "docs" / "v4" / "README.md")
-        (self.root / "VERSION").write_text("4.1.0\n")
+        (self.root / "VERSION").write_text(DEV_VERSION + "\n")
         self.step("INSTALL_BIN_LIB_DOCS")
         # hash verification
         mism = []
@@ -178,7 +179,7 @@ class Promotion:
     def migrate_and_verify(self):
         v4 = self.root / "bin" / "aimem"
         rc, out = run([sys.executable, str(v4), "version"], env=self.env)
-        self.gate("V4_EXECUTABLE_RUNS", rc == 0 and "aimem 4.1." in out, out)
+        self.gate("V4_EXECUTABLE_RUNS", rc == 0 and f"aimem {DEV_VERSION}" in out, out)
         rc, out = run([sys.executable, str(v4), "migrate", "--dry-run"], env=self.env)
         self.step("MIGRATE_DRY_RUN", out)
         rc, out = run([sys.executable, str(v4), "migrate"], env=self.env)

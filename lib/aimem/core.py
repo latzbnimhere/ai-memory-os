@@ -17,9 +17,10 @@ import tempfile
 import time
 from pathlib import Path
 
-VERSION = "4.1.0"
-ENGINE_LINEAGE = ["2.0.0 (V2)", "2.0.0+V3.1 (session binding)", "2.0.0+V3.1.1 (known-good baseline)", "4.0.0 (V4)", "4.0.1 (backup sidecar naming fix)", "4.1.0 (adaptive context + fail-closed activity heartbeat)"]
-PATCH_LEVEL = "V4.1.0"
+VERSION = "4.2.0"
+ENGINE_LINEAGE = ["2.0.0 (V2)", "2.0.0+V3.1 (session binding)", "2.0.0+V3.1.1 (known-good baseline)", "4.0.0 (V4)", "4.0.1 (backup sidecar naming fix)", "4.1.0 (adaptive context + fail-closed activity heartbeat)",
+                  "4.2.0 (production hardening: fail-closed integrity, incremental index, priority context budgeting)"]
+PATCH_LEVEL = "V4.2.0"
 
 ROOT = Path(os.environ.get("AI_MEMORY_ROOT", str(Path.home() / "AI-Memory"))).expanduser()
 PROJECTS = ROOT / "projects"
