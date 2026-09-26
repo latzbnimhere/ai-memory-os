@@ -370,5 +370,108 @@ class TestImportBackupMigrate(Base):
         self.assertFalse([a for a in plan if "project.json" in a], plan)
 
 
+class TestContextAndRetrieval(Base):
+    def setUp(self):
+        self.close_all()
+        self.cur = self.p / "CURRENT.md"
+        self.nxt = self.p / "NEXT.md"
+        self.cur_orig, self.nxt_orig = self.cur.read_text(), self.nxt.read_text()
+
+    def tearDown(self):
+        self.cur.write_text(self.cur_orig)
+        self.nxt.write_text(self.nxt_orig)
+
+    def build(self, query="", tokens=4500, mode="smart"):
+        from aimem import context
+        return context.build_context("hard", query, tokens, mode)
+
+    def test_next_survives_oversized_current_in_every_mode(self):
+        self.cur.write_text("# CUR\n" + "authoritative-current-state-line\n" * 4000)
+        self.nxt.write_text("# NEXT\n- EXACT_CONTINUATION_MARKER run the dry-run\n")
+        for mode, tokens in (("hot", 4500), ("smart", 4500), ("deep", 6000), ("smart", 1200)):
+            ctx = self.build("", tokens, mode)
+            budget = int(ctx.split("APPROX_TOKEN_BUDGET: ")[1].split()[0])
+            self.assertIn("EXACT_CONTINUATION_MARKER", ctx, mode)
+            self.assertIn("## CURRENT AUTHORITATIVE STATE", ctx, mode)
+            self.assertLessEqual(core.approx_tokens(ctx), budget, mode)
+
+    def test_journals_rendered_compactly_and_newest_kept(self):
+        sid = self.begin("journal")
+        for i in range(60):
+            run("note", "hard", "--kind", "info", "--text", f"event-number-{i:03d} " + "pad " * 40, "--session", sid, check=True)
+        ctx = self.build("", 1500, "hot")
+        self.assertIn("event-number-059", ctx)          # newest survives truncation
+        self.assertNotIn("event-number-000", ctx)       # oldest is what gets dropped
+        self.assertNotIn('"status_lines"', ctx)          # no raw repo-state JSON dumps
+        self.assertNotIn('"log_policy"', ctx)
+
+    def test_context_redacts_credentials_found_in_canonical_files(self):
+        token = "gh" + "p_" + "B" * 36
+        self.cur.write_text(self.cur_orig + f"\nleaked {token}\n")
+        ctx = self.build("")
+        self.assertNotIn(token, ctx)
+        self.assertIn("[REDACTED_SECRET]", ctx)
+
+    def test_context_is_deterministic_for_same_inputs(self):
+        # only wall-clock stamps may differ between two builds over unchanged inputs
+        strip = lambda c: "\n".join(l for l in c.splitlines() if not l.startswith("GENERATED: ") and '"captured_at"' not in l)
+        a, b = self.build("hard state"), self.build("hard state")
+        self.assertGreater(len(a.splitlines()), 40)
+        self.assertEqual(strip(a), strip(b))
+
+    def test_incremental_reindex_and_auto_refreshing_search(self):
+        from aimem import index
+        index.reindex("hard", quiet=True, full=True)
+        con = index.db_connect()
+        try:
+            self.assertEqual(index._refresh(con, "hard")[2:], (0, 0))
+            f = self.p / "knowledge" / "note.md"
+            f.parent.mkdir(exist_ok=True)
+            f.write_text("# note\nzebracornflake appears here\n")
+            self.assertEqual(index._refresh(con, "hard")[2], 1)
+            os.utime(f, None)  # touched but unchanged content: no re-chunking
+            self.assertEqual(index._refresh(con, "hard")[2], 0)
+            f.unlink()
+            self.assertEqual(index._refresh(con, "hard")[3], 1)
+        finally:
+            con.close()
+        self.assertEqual(index.fts_search("hard", "zebracornflake"), [])
+        run("note", "hard", "--kind", "decision", "--text", "adopt quokkaprotocol for sync", check=True)
+        hits = index.fts_search("hard", "quokkaprotocol")  # no explicit reindex in between
+        self.assertTrue(hits and hits[0]["kind"] == "decision", hits)
+        a = [(h["path"], h["chunk_no"]) for h in index.fts_search("hard", "hard project state")]
+        b = [(h["path"], h["chunk_no"]) for h in index.fts_search("hard", "hard project state")]
+        self.assertEqual(a, b)
+
+    def test_corrupt_index_is_quarantined_and_rebuilt_on_search(self):
+        from aimem import index
+        run("note", "hard", "--kind", "decision", "--text", "choose wombatstrategy", check=True)
+        index.reindex(None, quiet=True)
+        for suf in ("-wal", "-shm"):
+            Path(str(core.DB) + suf).unlink(missing_ok=True)
+        core.DB.write_bytes(b"this is not a sqlite database" * 100)
+        hits = index.fts_search("hard", "wombatstrategy")
+        self.assertTrue(hits)
+        self.assertTrue(list(core.DB.parent.glob("memory.db.corrupt-*")))
+        self.assertEqual(index.db_health(), "OK")
+
+    def test_legacy_index_schema_is_rebuilt(self):
+        import sqlite3
+        from aimem import index
+        with core.lock("index"):
+            for suf in ("", "-wal", "-shm"):
+                Path(str(core.DB) + suf).unlink(missing_ok=True)
+            con = sqlite3.connect(str(core.DB))
+            con.execute("CREATE TABLE chunks_meta(id INTEGER PRIMARY KEY, project TEXT, path TEXT, kind TEXT, chunk_no INT, sha256 TEXT)")
+            con.execute("CREATE VIRTUAL TABLE chunks_fts USING fts5(body, project UNINDEXED, path UNINDEXED, kind UNINDEXED, chunk_no UNINDEXED)")
+            con.commit()
+            con.close()
+        files, chunks = index.reindex(None, quiet=True)
+        self.assertGreater(chunks, 0)
+        con = index.db_connect()
+        self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], index.SCHEMA_VERSION)
+        con.close()
+
+
 if __name__ == "__main__":
     unittest.main()

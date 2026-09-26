@@ -365,12 +365,15 @@ class LockTimeout(AimemError):
 
 
 @contextlib.contextmanager
-def lock(name="global", timeout=None):
+def lock(name="global", timeout=None, required=True):
     """Exclusive advisory lock with bounded wait; fails closed on timeout.
 
     flock locks are released by the kernel when the holding process dies, so a crashed
     agent never leaves a stale lock behind; the lock file itself is only a rendezvous
     point (it records the last holder for diagnostics). Locks are NOT re-entrant.
+
+    Yields True when acquired. With required=False a timeout yields False (caller proceeds
+    without the lock, e.g. searching a slightly stale derived index) instead of failing.
     """
     ensure_root()
     if timeout is None:
@@ -387,6 +390,8 @@ def lock(name="global", timeout=None):
                 break
             except OSError:
                 if time.time() >= deadline:
+                    if not required:
+                        break
                     try:
                         f.seek(0)
                         holder = f.read(300).strip()
@@ -394,6 +399,9 @@ def lock(name="global", timeout=None):
                         holder = ""
                     raise LockTimeout(name, timeout, holder)
                 time.sleep(0.05)
+        if not acquired:
+            yield False
+            return
         try:
             f.seek(0)
             f.truncate()
@@ -401,7 +409,7 @@ def lock(name="global", timeout=None):
             f.flush()
         except Exception:
             pass
-        yield
+        yield True
     finally:
         if acquired:
             try:

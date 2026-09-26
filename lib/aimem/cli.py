@@ -112,7 +112,7 @@ def cmd_doctor(a):
 
 def cmd_reindex(a):
     from . import index
-    index.reindex(a.slug)
+    index.reindex(a.slug, full=a.full)
 
 
 def cmd_search(a):
@@ -561,7 +561,7 @@ def build_parser():
     p = sp.add_parser("status"); p.set_defaults(func=cmd_status)
     p = sp.add_parser("register"); p.add_argument("slug"); p.add_argument("--name"); p.add_argument("--repo"); p.add_argument("--update", action="store_true"); p.set_defaults(func=cmd_register)
     p = sp.add_parser("doctor"); p.add_argument("--deep", action="store_true"); p.add_argument("--repair", action="store_true"); p.add_argument("--no-repo", action="store_true", help="skip live repo checks"); p.add_argument("--slug"); p.set_defaults(func=cmd_doctor)
-    p = sp.add_parser("reindex"); p.add_argument("slug", nargs="?"); p.set_defaults(func=cmd_reindex)
+    p = sp.add_parser("reindex", help="refresh the derived search index (incremental; --full rebuilds)"); p.add_argument("slug", nargs="?"); p.add_argument("--full", action="store_true"); p.set_defaults(func=cmd_reindex)
     p = sp.add_parser("search"); p.add_argument("slug", nargs="?"); p.add_argument("query"); p.add_argument("--all", action="store_true"); p.add_argument("--limit", type=int, default=10); p.set_defaults(func=cmd_search)
     p = sp.add_parser("context"); p.add_argument("slug"); p.add_argument("--query", default=""); p.add_argument("--tokens", type=int); p.add_argument("--mode", choices=["hot", "smart", "deep"], default="smart"); p.add_argument("--output"); p.add_argument("--stdout", action="store_true"); p.set_defaults(func=cmd_context)
 

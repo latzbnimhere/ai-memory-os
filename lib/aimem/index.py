@@ -8,7 +8,11 @@ Ranking signals (all local, no embeddings):
   - verified provenance (+)
   - exact phrase match (+)
   - checkpoint/phase label match (+)
-Project scope is enforced by the WHERE clause.
+Project scope is enforced by the WHERE clause. Ties are broken by (path, chunk_no), so the
+same index and query always produce the same order.
+
+The index is derived and disposable. It is refreshed incrementally (per-file size/mtime,
+then sha256) and can always be rebuilt from canonical files with `aimem reindex --full`.
 """
 from __future__ import annotations
 
@@ -39,6 +43,9 @@ def _quarantine_db(reason):
     print(f"WARN: memory.db quarantined as memory.db.corrupt-{tag} ({reason}); index will be rebuilt", file=sys.stderr)
 
 
+SCHEMA_VERSION = 2  # PRAGMA user_version of the derived index; bump to force a clean rebuild
+
+
 def _open():
     con = sqlite3.connect(str(DB), timeout=30)
     con.execute("PRAGMA journal_mode=WAL")
@@ -46,17 +53,17 @@ def _open():
     return con
 
 
-def db_connect():
-    core.ensure_root()
-    try:
-        con = _open()
-    except sqlite3.DatabaseError as e:
-        _quarantine_db(str(e))
-        con = _open()
+def _create_schema(con):
     con.execute("""
         CREATE TABLE IF NOT EXISTS chunks_meta(
             id INTEGER PRIMARY KEY, project TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL,
             chunk_no INTEGER NOT NULL, sha256 TEXT NOT NULL, mtime REAL NOT NULL)
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS chunks_meta_path ON chunks_meta(project, path)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS files(
+            project TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+            sha256 TEXT NOT NULL, chunks INTEGER NOT NULL, PRIMARY KEY(project, path))
     """)
     try:
         con.execute("""
@@ -67,17 +74,27 @@ def db_connect():
     except sqlite3.OperationalError as e:
         con.close()
         core.die(f"SQLite FTS5 is unavailable: {e}")
-    # Upgrade path from V3 schema (no mtime column in fts)
-    cols = [r[1] for r in con.execute("PRAGMA table_info(chunks_fts)").fetchall()]
-    if "mtime" not in cols:
-        con.execute("DROP TABLE chunks_fts")
-        con.execute("DELETE FROM chunks_meta")
-        con.execute("""
-            CREATE VIRTUAL TABLE chunks_fts USING fts5(
-                body, project UNINDEXED, path UNINDEXED, kind UNINDEXED, chunk_no UNINDEXED, mtime UNINDEXED,
-                tokenize='unicode61')
-        """)
+
+
+def db_connect():
+    """Open (creating/upgrading) the derived index. Older layouts are dropped and rebuilt:
+    the index is disposable, canonical files are the source of truth."""
+    core.ensure_root()
+    try:
+        con = _open()
+        ver = con.execute("PRAGMA user_version").fetchone()[0]
+    except sqlite3.DatabaseError as e:
+        _quarantine_db(str(e))
+        con = _open()
+        ver = 0
+    if ver != SCHEMA_VERSION:
+        for t in ("chunks_fts", "chunks_meta", "files"):
+            con.execute(f"DROP TABLE IF EXISTS {t}")
+        _create_schema(con)
+        con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         con.commit()
+    else:
+        _create_schema(con)
     return con
 
 
@@ -131,11 +148,11 @@ def classify_path(rel: Path):
 
 def iter_index_files(slug=None):
     cfg = config()
-    roots = [(slug, project_dir(slug))] if slug else [(s, project_dir(s)) for s in registry()["projects"]]
+    roots = [(slug, project_dir(slug))] if slug else [(s, project_dir(s)) for s in sorted(registry()["projects"])]
     for s, root in roots:
         if not root.exists():
             continue
-        for f in root.rglob("*"):
+        for f in sorted(root.rglob("*")):
             if not f.is_file():
                 continue
             parts = f.relative_to(root).parts
@@ -147,6 +164,8 @@ def iter_index_files(slug=None):
                 continue
             if f.suffix.lower() not in TEXT_EXTS:
                 continue
+            if parts[0] == "checkpoints" and len(parts) > 2 and not (root / "checkpoints" / parts[1] / "meta.json").exists():
+                continue  # incomplete checkpoint (interrupted before sealing): never authoritative
             try:
                 if f.stat().st_size > cfg["max_index_file_bytes"]:
                     continue
@@ -155,39 +174,95 @@ def iter_index_files(slug=None):
             yield s, f
 
 
-def reindex(slug=None, quiet=False):
+def _delete_path(con, project, rel):
+    ids = [r[0] for r in con.execute("SELECT id FROM chunks_meta WHERE project=? AND path=?", (project, rel))]
+    for i in range(0, len(ids), 500):
+        batch = ids[i:i + 500]
+        con.execute(f"DELETE FROM chunks_fts WHERE rowid IN ({','.join('?' * len(batch))})", batch)
+    con.execute("DELETE FROM chunks_meta WHERE project=? AND path=?", (project, rel))
+    con.execute("DELETE FROM files WHERE project=? AND path=?", (project, rel))
+
+
+def _refresh(con, slug=None, full=False):
+    """Bring the index in line with the files on disk. Returns (files_in_scope, chunks_in_scope, changed, removed).
+
+    A file is re-read only when its size or mtime changed, and re-chunked only when its sha256
+    changed, so refreshing a project with a huge history costs one stat() per file.
+    """
+    scope = [slug] if slug else sorted(registry()["projects"])
+    if full:
+        for s in scope:
+            for t in ("chunks_meta", "chunks_fts", "files"):
+                con.execute(f"DELETE FROM {t} WHERE project=?", (s,))
+    if not slug:
+        # projects no longer registered
+        known = set(scope)
+        for (s,) in con.execute("SELECT DISTINCT project FROM files").fetchall():
+            if s not in known:
+                for t in ("chunks_meta", "chunks_fts", "files"):
+                    con.execute(f"DELETE FROM {t} WHERE project=?", (s,))
+    indexed = {}
+    for s in scope:
+        for path, size, mtime_ns, sha in con.execute("SELECT path, size, mtime_ns, sha256 FROM files WHERE project=?", (s,)):
+            indexed[(s, path)] = (size, mtime_ns, sha)
+    seen = set()
+    files = changed = 0
+    for s, f in iter_index_files(slug):
+        try:
+            st = f.stat()
+            rel = str(f.relative_to(ROOT))
+        except (OSError, ValueError):
+            continue
+        key = (s, rel)
+        seen.add(key)
+        files += 1
+        old = indexed.get(key)
+        if old and old[0] == st.st_size and old[1] == st.st_mtime_ns:
+            continue
+        try:
+            raw = f.read_text(errors="ignore")
+            sha = sha256_file(f)
+        except OSError:
+            continue
+        if old and old[2] == sha:
+            con.execute("UPDATE files SET size=?, mtime_ns=? WHERE project=? AND path=?", (st.st_size, st.st_mtime_ns, s, rel))
+            continue
+        changed += 1
+        _delete_path(con, s, rel)
+        kind = classify_path(Path(rel))
+        chunks = split_chunks(raw)
+        for i, body in enumerate(chunks):
+            cur = con.execute("INSERT INTO chunks_meta(project,path,kind,chunk_no,sha256,mtime) VALUES(?,?,?,?,?,?)",
+                              (s, rel, kind, i, sha, st.st_mtime))
+            con.execute("INSERT INTO chunks_fts(rowid,body,project,path,kind,chunk_no,mtime) VALUES(?,?,?,?,?,?,?)",
+                        (cur.lastrowid, body, s, rel, kind, i, st.st_mtime))
+        con.execute("INSERT OR REPLACE INTO files(project,path,size,mtime_ns,sha256,chunks) VALUES(?,?,?,?,?,?)",
+                    (s, rel, st.st_size, st.st_mtime_ns, sha, len(chunks)))
+    removed = 0
+    for key in indexed:
+        if key not in seen:
+            _delete_path(con, *key)
+            removed += 1
+    con.commit()
+    q = "SELECT COUNT(*) FROM chunks_meta" + (" WHERE project=?" if slug else "")
+    chunks_total = con.execute(q, (slug,) if slug else ()).fetchone()[0]
+    return files, chunks_total, changed, removed
+
+
+def reindex(slug=None, quiet=False, full=False):
+    """Incrementally refresh the derived index (full=True rebuilds the scope from scratch)."""
     core.ensure_root()
     if slug and not project_dir(slug).exists():
         core.die(f"Unknown project: {slug}")
     with core.lock("index", timeout=120):
         con = db_connect()
-        if slug:
-            con.execute("DELETE FROM chunks_meta WHERE project=?", (slug,))
-            con.execute("DELETE FROM chunks_fts WHERE project=?", (slug,))
-        else:
-            con.execute("DELETE FROM chunks_meta")
-            con.execute("DELETE FROM chunks_fts")
-        files = chunks = 0
-        for s, f in iter_index_files(slug):
-            try:
-                raw = f.read_text(errors="ignore")
-                rel = f.relative_to(ROOT)
-                sha = sha256_file(f)
-                mtime = f.stat().st_mtime
-            except Exception:
-                continue
-            files += 1
-            kind = classify_path(rel)
-            for i, body in enumerate(split_chunks(raw)):
-                con.execute("INSERT INTO chunks_meta(project,path,kind,chunk_no,sha256,mtime) VALUES(?,?,?,?,?,?)",
-                            (s, str(rel), kind, i, sha, mtime))
-                con.execute("INSERT INTO chunks_fts(body,project,path,kind,chunk_no,mtime) VALUES(?,?,?,?,?,?)",
-                            (body, s, str(rel), kind, i, mtime))
-                chunks += 1
-        con.commit()
-        con.close()
+        try:
+            files, chunks, changed, removed = _refresh(con, slug, full=full)
+        finally:
+            con.close()
     if not quiet:
-        print(f"REINDEX=PASS files={files} chunks={chunks} db={DB}")
+        print(f"REINDEX=PASS files={files} chunks={chunks} changed={changed} removed={removed} "
+              f"mode={'full' if full else 'incremental'} db={DB}")
     return files, chunks
 
 
@@ -221,29 +296,49 @@ def _rerank(rows, query, slug, limit):
             if terms and any(t in label for t in terms):
                 score += 0.3 * max(rel, 1.0)
         scored.append({"path": path, "kind": kind, "chunk_no": chunk_no, "snippet": snip, "rank": -score, "score": score, "body": body})
-    scored.sort(key=lambda x: -x["score"])
+    # deterministic: equal scores are ordered by path then chunk number
+    scored.sort(key=lambda x: (-round(x["score"], 9), x["path"], x["chunk_no"]))
     return scored[:limit]
 
 
-def fts_search(slug, query, limit=12):
+def _query(slug, match, limit):
+    con = db_connect()
+    try:
+        return con.execute("""
+            SELECT path, kind, chunk_no, snippet(chunks_fts,0,'[[',']]',' … ',42) AS snip,
+                   bm25(chunks_fts) AS rank, body, mtime
+            FROM chunks_fts WHERE chunks_fts MATCH ? AND project=? ORDER BY rank, path, chunk_no LIMIT ?
+        """, (match, slug, int(limit) * 6)).fetchall()
+    finally:
+        con.close()
+
+
+def fts_search(slug, query, limit=12, refresh=True):
+    """Ranked project-scoped search. Refreshes the project's index incrementally first (cheap: one
+    stat per file) so results include journal entries written since the last finish. If another
+    process holds the index lock, searches the existing index rather than waiting."""
     terms = search_terms(query)
     if not terms:
         return []
-    if DB.exists() and db_health() != "OK":
-        _quarantine_db(db_health())
-    if not DB.exists():
-        reindex(None, quiet=True)
-    con = db_connect()
+    if refresh:
+        with core.lock("index", timeout=3, required=False) as got:
+            if got:
+                con = db_connect()
+                try:
+                    _refresh(con, slug)
+                finally:
+                    con.close()
     match = " OR ".join('"' + t.replace('"', '') + '"' for t in terms)
     try:
-        rows = con.execute("""
-            SELECT path, kind, chunk_no, snippet(chunks_fts,0,'[[',']]',' … ',42) AS snip,
-                   bm25(chunks_fts) AS rank, body, mtime
-            FROM chunks_fts WHERE chunks_fts MATCH ? AND project=? ORDER BY rank LIMIT ?
-        """, (match, slug, int(limit) * 6)).fetchall()
+        rows = _query(slug, match, limit)
     except sqlite3.OperationalError:
-        rows = []
-    con.close()
+        rows = []  # malformed MATCH expression: no results rather than a crash
+    except sqlite3.DatabaseError as e:
+        # corrupt derived index: quarantine (never delete), rebuild, retry once
+        with core.lock("index", timeout=120):
+            _quarantine_db(str(e))
+        reindex(None, quiet=True)
+        rows = _query(slug, match, limit)
     return _rerank(rows, query, slug, limit)
 
 
