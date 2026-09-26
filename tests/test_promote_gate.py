@@ -1,6 +1,7 @@
 """Regression tests for the promotion zero-open-session gate (isolated temp root; never touches ~/AI-Memory)."""
 from __future__ import annotations
 
+import _isolation  # noqa: F401  (must precede any aimem import; see tests/_isolation.py)
 import os
 import shutil
 import subprocess

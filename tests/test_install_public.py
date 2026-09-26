@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import _isolation  # noqa: F401  (must precede any aimem import; see tests/_isolation.py)
 import os
 import subprocess
 import sys

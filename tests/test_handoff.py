@@ -1,4 +1,5 @@
 """Isolated bridge safety and lifecycle integration tests; no real Drive writes."""
+import _isolation  # noqa: F401  (must precede any aimem import; see tests/_isolation.py)
 import contextlib
 import io
 import json
@@ -17,7 +18,9 @@ class BridgeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix='handoff-test-'))
         self.root = self.tmp/'memory'; self.root.mkdir()
-        self.patch = mock.patch.multiple(core,ROOT=self.root,LOCKS=self.root/'.locks'); self.patch.start()
+        self.patch = mock.patch.multiple(core,ROOT=self.root,LOCKS=self.root/'.locks',PROJECTS=self.root/'projects',
+            REGISTRY=self.root/'registry'/'projects.json',CONFIG=self.root/'config.json',DB=self.root/'registry'/'memory.db',
+            OBJECTS=self.root/'objects',RUN=self.root/'.run'); self.patch.start()
         self.drive = self.tmp/'CloudStorage/GoogleDrive-test/My Drive/AI-Project-Handoffs'
         self.drive.mkdir(parents=True)
         (self.drive/'00-MASTER').mkdir()

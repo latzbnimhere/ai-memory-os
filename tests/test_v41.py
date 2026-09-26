@@ -6,6 +6,7 @@ before importing aimem. This keeps it isolated from other unittest modules.
 
 from __future__ import annotations
 
+import _isolation  # noqa: F401  (must precede any aimem import; see tests/_isolation.py)
 import os
 from pathlib import Path
 import subprocess

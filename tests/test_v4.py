@@ -1,6 +1,7 @@
 """Unit tests for AI Memory OS V4 internals (stdlib unittest; isolated temp root)."""
 from __future__ import annotations
 
+import _isolation  # noqa: F401  (must precede any aimem import; see tests/_isolation.py)
 import json
 import os
 import shutil
