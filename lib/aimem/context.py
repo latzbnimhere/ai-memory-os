@@ -86,6 +86,7 @@ def journal_text(path, n, skip_kinds=()):
 
 
 TRUNC_MARK = "\n[TRUNCATED]\n"
+TAIL_MARK = "[EARLIER ENTRIES TRUNCATED]\n"
 
 
 def allocate(sections, budget):
@@ -101,8 +102,10 @@ def allocate(sections, budget):
         sec["head"] = f"\n---\n## {sec['title']}\nAUTHORITY: {sec['authority']}\n"
         sec["take"] = 0
 
-    def cost(sec, n):
-        return len(sec["head"]) + n + (len(TRUNC_MARK) if n < len(sec["body"]) else 1)
+    def cost(sec, n):  # exact rendered length of sec with n body chars (see rendering below)
+        if n >= len(sec["body"]):
+            return len(sec["head"]) + len(sec["body"]) + 1
+        return len(sec["head"]) + n + (len(TAIL_MARK) + 1 if sec.get("keep_tail") else len(TRUNC_MARK))
 
     def worth(sec, n):  # never emit a uselessly tiny fragment
         return n >= min(len(sec["body"]), 200)
@@ -111,7 +114,7 @@ def allocate(sections, budget):
     order = sorted(sections, key=lambda x: x["priority"])
     for sec in order:
         want = min(len(sec["body"]), max(200, int(budget * sec["cap"]) - len(sec["head"])))
-        n = min(want, remaining - len(sec["head"]) - len(TRUNC_MARK))
+        n = min(want, remaining - len(sec["head"]) - len(TAIL_MARK) - 1)
         if n > 0 and worth(sec, n):
             sec["take"] = n
             remaining -= cost(sec, n)
@@ -119,7 +122,7 @@ def allocate(sections, budget):
         if sec["take"] >= len(sec["body"]):
             continue
         base = cost(sec, sec["take"]) if sec["take"] else 0
-        n = min(len(sec["body"]), remaining + base - len(sec["head"]) - len(TRUNC_MARK))
+        n = min(len(sec["body"]), remaining + base - len(sec["head"]) - len(TAIL_MARK) - 1)
         if n > sec["take"] and worth(sec, n):
             remaining -= cost(sec, n) - base
             sec["take"] = n
@@ -134,7 +137,7 @@ def allocate(sections, budget):
             # chronological journals: keep the NEWEST entries, drop whole older lines
             tail = body[len(body) - n:]
             tail = tail.split("\n", 1)[1] if "\n" in tail else tail
-            out.append(sec["head"] + TRUNC_MARK.lstrip("\n").replace("TRUNCATED", "EARLIER ENTRIES TRUNCATED") + tail + "\n")
+            out.append(sec["head"] + TAIL_MARK + tail + "\n")
         else:
             out.append(sec["head"] + body[:n] + TRUNC_MARK)
     return out

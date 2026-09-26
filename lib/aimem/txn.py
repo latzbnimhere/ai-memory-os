@@ -227,6 +227,29 @@ def repair(slug):
     return actions
 
 
+def discard(slug, txid):
+    """Explicit human decision to abandon one pending transaction: delete its staged files and record.
+
+    Targets already replaced by a COMMITTING transaction are NOT reverted (their pre-images are
+    gone); they are reported so the operator can check them. Never automatic.
+    """
+    with core.project_write_lock(slug):
+        for rec in pending(slug):
+            if rec.get("id") != txid:
+                continue
+            entries = rec.get("entries", [])
+            applied = [e["target"] for e in entries if not os.path.exists(e.get("staged", ""))]
+            for e in entries:
+                if os.path.exists(e.get("staged", "")):
+                    os.unlink(e["staged"])
+            Path(rec["path"]).unlink()
+            core.append_jsonl(project_dir(slug) / "cold" / "txn-journal" / f"{core.day()}.jsonl", {
+                "time": iso(), "txn": txid, "state": "DISCARDED", "previous_state": rec.get("state"),
+                "already_applied_targets": [Path(t).name for t in applied] if rec.get("state") != "PREPARED" else []})
+            return rec.get("state"), (applied if rec.get("state") != "PREPARED" else [])
+    core.die(f"No pending transaction {txid} for {slug}")
+
+
 # ---------------------------------------------------------------- canonical update helper
 
 class VersionConflict(core.AimemError):

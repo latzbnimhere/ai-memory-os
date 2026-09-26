@@ -67,8 +67,9 @@ def packet(slug, sid):
     p = project_dir(slug)
     f = sessions.session_file(slug, sid)
     j = try_load_json(f, None)
-    if j is None:
+    if not isinstance(j, dict):
         core.die(f"Session not found: {sid}")
+    j.setdefault("id", sid)
     a = assess_session(slug, f, j)
     steps = read_jsonl(sessions.steps_file(slug, sid))
     live, start = a["live"], a["start_repo"]

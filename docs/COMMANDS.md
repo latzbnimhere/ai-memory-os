@@ -16,7 +16,7 @@ Every command that takes a project slug refuses unknown or unsafe slugs (exit 2)
 | `aimem checkpoint <slug> --label L --result R [--session] [--no-advance-current] [--expect-version N] [--allow-secret-pattern]` | checkpoint without closing |
 | `aimem write-current <slug> --current F --next F [--session] [--expect-version N]` | transactional CAS write of CURRENT/NEXT (secret patterns rejected) |
 | `aimem sessions [slug] [--open]` / `aimem session show|close <slug> --session ID [--result] [--note]` | list / inspect / administratively close |
-| `aimem txn [slug] [--repair]` | inspect (read-only) or deterministically repair interrupted transactions (`MANUAL_TARGET_CHANGED` is never auto-applied) |
+| `aimem txn [slug] [--repair]` / `aimem txn <slug> --discard TXID` | inspect (read-only), deterministically repair, or explicitly abandon one reviewed transaction (`MANUAL_TARGET_CHANGED` is never auto-applied; discard never reverts already-applied targets and lists them) |
 | `aimem recover [slug] [--session ID]` | read-only crash/abandonment scan; writes bounded recovery packets |
 | `aimem reconcile <slug>` | memory vs physical classification |
 | `aimem fact set|list <slug> ...` | structured provenance |

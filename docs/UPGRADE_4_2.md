@@ -24,7 +24,9 @@ memory root. Do not treat a live root as upgraded until the steps below pass on 
 | Search ran `PRAGMA integrity_check` on every query and did not see new journal entries until the next reindex | no per-query scan; project index refreshed before searching |
 | NEXT.md could be dropped from context when CURRENT.md filled the budget; events were raw JSON and truncation dropped the newest | priority budgeting (NEXT/CURRENT always present), one line per record, oldest dropped first |
 | `migrate` from an older engine could overwrite newer VERSION/config/manifests | refuses before changing anything |
-| Backup restore trusted tar symlinks/hardlinks | only files, dirs and in-root symlinks are extracted |
+| Backup restore trusted tar symlinks/hardlinks | only files, dirs, in-root symlinks and in-archive hardlinks are extracted; symlinks pointing outside the root are not archived (listed in the backup's meta sidecar) |
+| Stale/unwanted pending transactions could only be removed by hand | `aimem txn <slug> --discard <txid>` after review |
+| `capture` wrote REPO_STATE.json even with a pending transaction | refuses with exit 4 |
 | Running the unit tests without `AI_MEMORY_ROOT` could resolve paths against `~/AI-Memory` | every test process uses a throwaway root and HOME |
 
 Scripts that parse `REINDEX=PASS files=N chunks=M` still work; the line gained `changed=`, `removed=` and `mode=`.

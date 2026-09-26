@@ -14,7 +14,8 @@ staging or COMMITTING -> roll forward; PREPARED with missing staging -> roll bac
 While a transaction is pending, finish/checkpoint/write-current fail closed with exit 4 (`UNRESOLVED_TRANSACTIONS`).
 `MANUAL_TARGET_CHANGED`: a target was rewritten after the interruption (it matches neither its pre-image nor the staged
 content). Repair will not apply the stale staged copy. Compare the staged file (`.<name>.<txid>.staged`) with the live
-file, keep the correct content, then delete the staged file and the record in `projects/<slug>/.txn/`.
+file and keep the correct content. Then abandon the transaction with `aimem txn <slug> --discard <txid>` (deletes the
+staged files and record, journals the decision, and lists any targets a COMMITTING transaction had already replaced).
 
 Torn journal lines (a crash mid-append): `aimem doctor` reports `invalid JSONL <file>:<line>`; later appends start on a
 new line, so only that line is affected. `aimem doctor --repair` moves unparseable lines out of the journal in place

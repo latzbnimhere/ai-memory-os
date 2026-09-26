@@ -240,6 +240,14 @@ def cmd_write_current(a):
 def cmd_txn(a):
     from . import txn
     core.ensure_root()
+    if a.discard:
+        if not a.slug:
+            die("--discard requires an explicit project slug")
+        state, applied = txn.discard(a.slug, a.discard)
+        print(f"TXN_DISCARDED={a.discard} previous_state={state}")
+        for t in applied:
+            print(f"ALREADY_APPLIED_NOT_REVERTED={t} (verify this file)")
+        return
     slugs = [a.slug] if a.slug else core.all_slugs()
     total = 0
     for slug in slugs:
@@ -366,10 +374,13 @@ def cmd_artifact(a):
 
 def cmd_capture(a):
     from . import provenance
+    from . import txn
     core.ensure_root()
     p = project_dir(a.slug)
     state = core.repo_state_for(a.slug)
-    atomic_write_json(p / "REPO_STATE.json", state)
+    with core.project_write_lock(a.slug):
+        txn.require_no_pending(a.slug)  # REPO_STATE.json may be a target of an interrupted transaction
+        atomic_write_json(p / "REPO_STATE.json", state)
     append_jsonl(p / "EVENTS.jsonl", {"time": iso(), "kind": "repo_capture", "repo_state": state})
     provenance.record_physical_git(a.slug, state, session=a.session, source_ref="capture")
     print(json.dumps(state, indent=2))
@@ -572,7 +583,7 @@ def build_parser():
     p = sp.add_parser("sessions"); p.add_argument("slug", nargs="?"); p.add_argument("--open", action="store_true"); p.set_defaults(func=cmd_sessions)
     p = sp.add_parser("session"); p.add_argument("action", choices=["close", "show"]); p.add_argument("slug"); p.add_argument("--session"); p.add_argument("--result", default="ABANDONED"); p.add_argument("--note"); p.set_defaults(func=cmd_session)
     p = sp.add_parser("write-current", help="transactional CAS write of CURRENT.md/NEXT.md from files"); p.add_argument("slug"); p.add_argument("--current"); p.add_argument("--next"); p.add_argument("--session"); p.add_argument("--expect-version", type=int); p.add_argument("--allow-secret-pattern", action="store_true"); p.set_defaults(func=cmd_write_current)
-    p = sp.add_parser("txn"); p.add_argument("slug", nargs="?"); p.add_argument("--repair", action="store_true"); p.set_defaults(func=cmd_txn)
+    p = sp.add_parser("txn"); p.add_argument("slug", nargs="?"); g = p.add_mutually_exclusive_group(); g.add_argument("--repair", action="store_true"); g.add_argument("--discard", metavar="TXID", help="abandon one pending transaction after manual review (never automatic)"); p.set_defaults(func=cmd_txn)
 
     p = sp.add_parser("recover"); p.add_argument("slug", nargs="?"); p.add_argument("--session"); p.set_defaults(func=cmd_recover)
     p = sp.add_parser("reconcile"); p.add_argument("slug"); p.set_defaults(func=cmd_reconcile)
@@ -615,8 +626,11 @@ def main(argv=None):
     slug = getattr(args, "slug", None)
     if slug and args.cmd not in _SLUG_MAY_BE_NEW:
         # Fail closed before any command can create stray directories/journals for a typo'd or unsafe slug.
+        # A registered project whose project.json is missing/damaged is still accepted, so diagnostic and
+        # repair commands (doctor --slug, txn --repair, recover, health) can reach it.
         core.ensure_root()
-        if not core.project_exists(slug):
+        core.safe_component(slug, "slug")
+        if not (core.project_exists(slug) or slug in core.all_slugs()):
             die(f"Unknown project: {slug} (registered: {', '.join(core.all_slugs()) or 'none'})")
     try:
         args.func(args)

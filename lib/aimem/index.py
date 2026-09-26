@@ -76,10 +76,22 @@ def _create_schema(con):
         core.die(f"SQLite FTS5 is unavailable: {e}")
 
 
-def db_connect():
+def db_connect(migrate=True):
     """Open (creating/upgrading) the derived index. Older layouts are dropped and rebuilt:
-    the index is disposable, canonical files are the source of truth."""
+    the index is disposable, canonical files are the source of truth.
+
+    Schema changes happen only with migrate=True, which callers use while holding the "index"
+    lock. With migrate=False an out-of-date or missing schema returns None (caller treats the
+    index as empty) instead of dropping tables unlocked under a concurrent reindex."""
     core.ensure_root()
+    if not migrate:
+        if not DB.exists():
+            return None
+        con = _open()
+        if con.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            con.close()
+            return None
+        return con
     try:
         con = _open()
         ver = con.execute("PRAGMA user_version").fetchone()[0]
@@ -183,7 +195,7 @@ def _delete_path(con, project, rel):
     con.execute("DELETE FROM files WHERE project=? AND path=?", (project, rel))
 
 
-def _refresh(con, slug=None, full=False):
+def _refresh(con, slug=None, full=False, verify_fts=True):
     """Bring the index in line with the files on disk. Returns (files_in_scope, chunks_in_scope, changed, removed).
 
     A file is re-read only when its size or mtime changed, and re-chunked only when its sha256
@@ -193,9 +205,11 @@ def _refresh(con, slug=None, full=False):
     for s in scope:
         # Consistency guard: an older engine (e.g. after a rollback) may have rewritten chunks without
         # maintaining `files`; any disagreement means the bookkeeping cannot be trusted -> rebuild project.
+        # (files and chunks_meta are indexed lookups; the FTS count is a table scan, so the per-search
+        # refresh skips it and reindex/finish perform it.)
         tracked = con.execute("SELECT COALESCE(SUM(chunks), 0) FROM files WHERE project=?", (s,)).fetchone()[0]
         actual = con.execute("SELECT COUNT(*) FROM chunks_meta WHERE project=?", (s,)).fetchone()[0]
-        fts = con.execute("SELECT COUNT(*) FROM chunks_fts WHERE project=?", (s,)).fetchone()[0]
+        fts = con.execute("SELECT COUNT(*) FROM chunks_fts WHERE project=?", (s,)).fetchone()[0] if verify_fts else actual
         if full or tracked != actual or actual != fts:
             for t in ("chunks_meta", "chunks_fts", "files"):
                 con.execute(f"DELETE FROM {t} WHERE project=?", (s,))
@@ -254,17 +268,28 @@ def _refresh(con, slug=None, full=False):
     return files, chunks_total, changed, removed
 
 
+def _locked_refresh(slug=None, full=False, verify_fts=True):
+    """Caller holds the "index" lock."""
+    con = db_connect()
+    try:
+        return _refresh(con, slug, full=full, verify_fts=verify_fts)
+    finally:
+        con.close()
+
+
 def reindex(slug=None, quiet=False, full=False):
     """Incrementally refresh the derived index (full=True rebuilds the scope from scratch)."""
     core.ensure_root()
     if slug and not project_dir(slug).exists():
         core.die(f"Unknown project: {slug}")
     with core.lock("index", timeout=120):
-        con = db_connect()
         try:
-            files, chunks, changed, removed = _refresh(con, slug, full=full)
-        finally:
-            con.close()
+            files, chunks, changed, removed = _locked_refresh(slug, full=full)
+        except sqlite3.DatabaseError as e:
+            # corrupt derived index: quarantine (never delete) and rebuild everything from canonical files
+            _quarantine_db(str(e))
+            _locked_refresh(None, full=True)
+            files, chunks, changed, removed = _locked_refresh(slug)
     if not quiet:
         print(f"REINDEX=PASS files={files} chunks={chunks} changed={changed} removed={removed} "
               f"mode={'full' if full else 'incremental'} db={DB}")
@@ -307,7 +332,9 @@ def _rerank(rows, query, slug, limit):
 
 
 def _query(slug, match, limit):
-    con = db_connect()
+    con = db_connect(migrate=False)
+    if con is None:
+        return []
     try:
         return con.execute("""
             SELECT path, kind, chunk_no, snippet(chunks_fts,0,'[[',']]',' … ',42) AS snip,
@@ -325,26 +352,34 @@ def fts_search(slug, query, limit=12, refresh=True):
     terms = search_terms(query)
     if not terms:
         return []
-    if refresh:
-        with core.lock("index", timeout=3, required=False) as got:
-            if got:
-                con = db_connect()
-                try:
-                    _refresh(con, slug)
-                finally:
-                    con.close()
     match = " OR ".join('"' + t.replace('"', '') + '"' for t in terms)
     try:
+        if refresh:
+            with core.lock("index", timeout=3, required=False) as got:
+                if got:
+                    _locked_refresh(slug, verify_fts=False)
         rows = _query(slug, match, limit)
-    except sqlite3.OperationalError:
-        rows = []  # malformed MATCH expression: no results rather than a crash
+    except sqlite3.OperationalError as e:
+        if "malformed" in str(e) or "not a database" in str(e):
+            rows = _recover_and_query(slug, match, limit, e)
+        else:
+            rows = []  # malformed MATCH expression: no results rather than a crash
     except sqlite3.DatabaseError as e:
-        # corrupt derived index: quarantine (never delete), rebuild, retry once
-        with core.lock("index", timeout=120):
-            _quarantine_db(str(e))
-        reindex(None, quiet=True)
-        rows = _query(slug, match, limit)
+        rows = _recover_and_query(slug, match, limit, e)
     return _rerank(rows, query, slug, limit)
+
+
+def _recover_and_query(slug, match, limit, err):
+    """Corrupt derived index: quarantine (never delete), rebuild from canonical files, retry once."""
+    reindex(None, quiet=True, full=True)  # reindex quarantines on DatabaseError itself
+    if db_health() != "OK":
+        with core.lock("index", timeout=120):
+            _quarantine_db(str(err))
+            _locked_refresh(None, full=True)
+    try:
+        return _query(slug, match, limit)
+    except sqlite3.DatabaseError:
+        return []
 
 
 def db_health():

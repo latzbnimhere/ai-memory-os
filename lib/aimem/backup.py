@@ -28,23 +28,32 @@ def sidecar(tar_path, suffix):
     return legacy if legacy.exists() else new
 
 
+def _contained_symlink(name, linkname):
+    import posixpath
+    target = posixpath.normpath(posixpath.join(posixpath.dirname(name), linkname))
+    return not linkname.startswith("/") and (target == "AI-Memory" or target.startswith("AI-Memory/"))
+
+
 def unsafe_members(tf):
     """Names of tar members that must never be extracted from a backup.
 
-    Allowed: regular files, directories, and symlinks whose (relative) target stays inside
-    AI-Memory/. Refused: absolute paths, '..', members outside AI-Memory/, hardlinks,
+    Allowed: regular files, directories, symlinks whose (relative) target stays inside
+    AI-Memory/, and hardlinks to another member under AI-Memory/ (tarfile emits these for
+    files with several links). Refused: absolute paths, '..', members outside AI-Memory/,
     escaping or absolute symlinks (which could redirect later members outside the
     extraction target), devices and FIFOs.
     """
-    import posixpath
     bad = []
     for m in tf.getmembers():
         parts = Path(m.name).parts
         if m.name.startswith("/") or ".." in parts or not parts or parts[0] != "AI-Memory":
             bad.append(m.name)
         elif m.issym():
-            target = posixpath.normpath(posixpath.join(posixpath.dirname(m.name), m.linkname))
-            if m.linkname.startswith("/") or not (target == "AI-Memory" or target.startswith("AI-Memory/")):
+            if not _contained_symlink(m.name, m.linkname):
+                bad.append(m.name)
+        elif m.islnk():
+            lp = Path(m.linkname).parts
+            if m.linkname.startswith("/") or ".." in lp or not lp or lp[0] != "AI-Memory":
                 bad.append(m.name)
         elif not (m.isfile() or m.isdir()):
             bad.append(m.name)
@@ -83,6 +92,8 @@ def _manifest(root: Path):
             if fn.endswith(".staged") or fn.endswith(".tmp"):
                 continue
             fp = Path(r) / fn
+            if fp.is_symlink() and not _contained_symlink(f"AI-Memory/{fp.relative_to(root)}", os.readlink(fp)):
+                continue  # not archived either (see create())
             try:
                 lines.append(f"{sha256_file(fp)}  {fp.relative_to(root)}")
             except OSError:
@@ -99,6 +110,7 @@ def create(output_dir=None, label=""):
     target = outdir / f"{name}.tar.gz"
     manifest = _manifest(ROOT)
     tmp = Path(str(target) + ".partial")
+    skipped_links = []
 
     def flt(ti):
         parts = Path(ti.name).parts
@@ -109,6 +121,9 @@ def create(output_dir=None, label=""):
         if len(parts) >= 3 and parts[1] == "registry" and parts[2] in EXCLUDE_DB:
             return None
         if ti.name.endswith(".staged") or ti.name.endswith(".tmp"):
+            return None
+        if ti.issym() and not _contained_symlink(ti.name, ti.linkname):
+            skipped_links.append(ti.name)  # never archive a link that would point outside the restored root
             return None
         return ti
 
@@ -128,7 +143,11 @@ def create(output_dir=None, label=""):
     core.atomic_write(sidecar(target, "sha256"), f"{sha256_file(target)}  {target.name}\n")
     core.atomic_write(sidecar(target, "meta.json"), core.dumps({
         "created": iso(), "engine_version": core.VERSION, "root": str(ROOT), "label": label,
-        "bytes": target.stat().st_size, "sha256": sha256_file(target), "manifest_entries": manifest.count("\n")}))
+        "bytes": target.stat().st_size, "sha256": sha256_file(target), "manifest_entries": manifest.count("\n"),
+        "skipped_external_symlinks": skipped_links[:200]}))
+    if skipped_links:
+        print(f"WARN: backup skipped {len(skipped_links)} symlink(s) pointing outside the memory root "
+              f"(listed in {sidecar(target, 'meta.json').name})", file=sys.stderr)
     return target
 
 

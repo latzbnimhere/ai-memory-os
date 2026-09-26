@@ -277,10 +277,14 @@ def tail_lines(path: Path, n, block=65536):
             pos -= step
             f.seek(pos)
             buf = f.read(step) + buf
-    lines = buf.decode("utf-8", errors="ignore").splitlines()
-    if pos > 0 and lines:
-        lines = lines[1:]  # first line may be partial
-    return lines[-n:]
+    # split on b"\n" only: str.splitlines() would also break on U+2028/U+2029/U+0085, which
+    # append_jsonl writes raw (ensure_ascii=False), silently splitting one record into two bad lines
+    raw = buf.split(b"\n")
+    if raw and raw[-1] == b"":
+        raw.pop()
+    if pos > 0 and raw:
+        raw = raw[1:]  # first line may be partial
+    return [x.decode("utf-8", errors="ignore").rstrip("\r") for x in raw[-n:]]
 
 
 def read_tail(path: Path, n):
@@ -288,16 +292,18 @@ def read_tail(path: Path, n):
 
 
 def tail_jsonl(path: Path, n):
-    """Last n parseable JSON records (malformed lines skipped)."""
+    """Last n parseable JSON object records (malformed lines and non-object values skipped)."""
     out = []
     for line in tail_lines(path, n):
         line = line.strip()
         if not line:
             continue
         try:
-            out.append(json.loads(line))
+            rec = json.loads(line)
         except Exception:
             continue
+        if isinstance(rec, dict):
+            out.append(rec)
     return out
 
 
@@ -343,7 +349,7 @@ def ensure_root():
 def version_tuple(v):
     """'4.1.0' -> (4, 1, 0); unparseable -> None (callers must treat None as unknown, never as older)."""
     import re as _re
-    m = _re.match(r"^\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", str(v or ""))
+    m = _re.match(r"^\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", str(v or ""), _re.IGNORECASE)
     if not m:
         return None
     return tuple(int(x or 0) for x in m.groups())

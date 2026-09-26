@@ -60,8 +60,10 @@ def all_sessions(slug):
         if f.name.endswith(".steps.jsonl"):
             continue
         j = try_load_json(f, None)
-        if j is None:
+        if not isinstance(j, dict):
             continue
+        if not j.get("id"):
+            j["id"] = f.stem  # legacy/damaged record: the file name is the id (never written back)
         out.append((f, j))
     return out
 
@@ -196,7 +198,7 @@ def _allocate_checkpoint_dir(p, label):
 
 
 def create_checkpoint(slug, label, result, summary="", session_id=None, advance_current=True, expect_version=None,
-                      allow_secret_pattern=False):
+                      allow_secret_pattern=False, publish=True):
     """Seal CURRENT/NEXT + fresh repo state into an immutable checkpoint and bump memory_version.
 
     Everything that must agree (CAS check, snapshot of CURRENT/NEXT, meta.json, REPO_STATE.json,
@@ -236,15 +238,25 @@ def create_checkpoint(slug, label, result, summary="", session_id=None, advance_
                 session=session_id, expect_version=actual, kind="checkpoint", manifest_patch=patch, txn_id=txid)
             committed = True
         finally:
-            # Never leave a half-built, unreferenced checkpoint behind. The one exception is a transaction
-            # interrupted mid-commit: its record stays pending and may still roll meta.json forward into cpd.
-            if not committed and not (txid and any(t.get("id") == txid for t in txn.pending(slug))):
+            # Never leave a half-built, unreferenced checkpoint behind. Keep it when meta.json exists (it only
+            # appears through the committed transaction, so this also covers an interrupt landing between the
+            # commit and `committed = True`) or when an interrupted transaction may still roll it forward.
+            if not committed and not (cpd / "meta.json").exists() \
+                    and not (txid and any(t.get("id") == txid for t in txn.pending(slug))):
                 shutil.rmtree(cpd, ignore_errors=True)
     append_jsonl(p / "EVENTS.jsonl", {"time": iso(), "kind": "checkpoint", **meta})
     provenance.record_fact(slug, "checkpoint.current" if advance_current else "checkpoint.admin", cp_id, "CHECKPOINT",
                            source_ref=str(cpd / "meta.json"), status="VERIFIED", session=session_id,
                            evidence_sha256=meta["current_sha256"], note=f"result={result}")
     provenance.record_physical_git(slug, repo_state, session=session_id, source_ref="checkpoint")
+    if publish:
+        publish_checkpoint(slug, label, result)
+    return cp_id, version
+
+
+def publish_checkpoint(slug, label, result):
+    """Post-commit side effects (master index, optional memory-root git commit, optional handoff bridge).
+    Slow (git, Drive folder) and non-canonical, so finish runs them after releasing the session lock."""
     core.rebuild_master_index()
     core.git_memory_commit(f"{slug}: checkpoint {label} [{result}]")
     # Optional navigation publication runs only after canonical local persistence.
@@ -253,7 +265,6 @@ def create_checkpoint(slug, label, result, summary="", session_id=None, advance_
         handoff.after_checkpoint(slug)
     except (Exception, SystemExit):
         print("HANDOFF_SYNC=FAILED RETRY=aimem_handoff_--retry-pending")
-    return cp_id, version
 
 
 def finish(slug, session=None, result="", label=None, summary="", allow_unchanged=False,
@@ -263,8 +274,9 @@ def finish(slug, session=None, result="", label=None, summary="", allow_unchange
     from . import index as indexmod
     core.ensure_root()
     with core.project_session_lock(slug):
-        cp_id, version = _finish_locked(slug, session, result, label, summary, allow_unchanged, no_advance_current,
-                                        expect_version, acknowledge_newer, allow_secret_pattern)
+        cp_id, version, lbl = _finish_locked(slug, session, result, label, summary, allow_unchanged, no_advance_current,
+                                             expect_version, acknowledge_newer, allow_secret_pattern)
+    publish_checkpoint(slug, lbl, result)
     indexmod.reindex(slug, quiet=True)
     return cp_id, version
 
@@ -303,7 +315,7 @@ def _finish_locked(slug, session, result, label, summary, allow_unchanged, no_ad
         expect_version = actual_version
     lbl = label or state.get("task") or "session finish"
     cp_id, version = create_checkpoint(slug, lbl, result, summary, state.get("id"), not no_advance_current, expect_version,
-                                       allow_secret_pattern)
+                                       allow_secret_pattern, publish=False)
     state["status"] = "CLOSED"
     state["finished_at"] = iso()
     state["result"] = result
@@ -317,7 +329,7 @@ def _finish_locked(slug, session, result, label, summary, allow_unchanged, no_ad
     atomic_write_json(sf, state)
     append_jsonl(p / "EVENTS.jsonl", {"time": iso(), "kind": "session_finish", "session_id": state.get("id"),
                                        "result": result, "checkpoint": cp_id, "memory_version": version})
-    return cp_id, version
+    return cp_id, version, lbl
 
 
 def close_session(slug, sid, result="ABANDONED", note=""):

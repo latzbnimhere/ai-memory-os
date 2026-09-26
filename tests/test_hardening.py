@@ -536,5 +536,134 @@ class TestDoctor(Base):
             shutil.rmtree(legacy, ignore_errors=True)
 
 
+class TestReviewFindings(Base):
+    """Regressions for issues found by adversarial review of this hardening round."""
+
+    def test_corrupt_index_pages_do_not_break_begin_or_search(self):
+        from aimem import index
+        kdir = self.p / "knowledge"
+        kdir.mkdir(exist_ok=True)
+        for i in range(200):
+            (kdir / f"k{i}.md").write_text(f"# note {i}\n" + ("alpha beta gamma delta " * 60) + f"marmot{i}\n")
+        index.reindex(None, quiet=True, full=True)
+        with core.lock("index"):
+            con = index.db_connect()
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            con.close()
+        size = core.DB.stat().st_size
+        self.assertGreater(size, 64 * 1024)
+        with core.DB.open("r+b") as f:  # header intact, interior pages destroyed
+            f.seek(size // 2)
+            f.write(b"\xff" * 8192)
+        r = run("search", "hard", "marmot7")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.close_all()
+        r = run("begin", "hard", "--agent", "other", "--task", "after corruption")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.close_all()
+        # corruption on pages a query never touches is healed by the finish-time reindex (full consistency
+        # scan) or by `doctor --repair`; either way the canonical files rebuild it
+        if index.db_health() != "OK":
+            r = run("doctor", "--no-repo", "--slug", "hard")
+            self.assertIn("memory.db CORRUPT", r.stdout)
+            run("doctor", "--no-repo", "--slug", "hard", "--repair")
+        self.assertEqual(index.db_health(), "OK")
+        self.assertTrue(index.fts_search("hard", "marmot7"))
+        shutil.rmtree(kdir)
+
+    def test_unicode_line_separators_do_not_drop_records(self):
+        f = self.p / "u2028.jsonl"
+        core.append_jsonl(f, {"n": 1})
+        core.append_jsonl(f, {"n": 2, "text": "pasted\u2028line\u2029and\u0085more"})
+        core.append_jsonl(f, {"n": 3})
+        self.assertEqual([r["n"] for r in core.tail_jsonl(f, 10)], [1, 2, 3])
+        self.assertEqual(len(core.tail_lines(f, 10)), 3)
+
+    def test_non_object_json_record_does_not_break_context(self):
+        from aimem import context
+        ev = self.p / "EVENTS.jsonl"
+        with ev.open("a") as fh:
+            fh.write('"hello"\n[1, 2]\n42\n')
+        ctx = context.build_context("hard", "", 4500)
+        self.assertIn("## NEXT ACTIONS", ctx)
+
+    def test_diagnostics_reach_registered_project_with_missing_manifest(self):
+        cli.main(["register", "broken", "--name", "Broken"])
+        try:
+            (core.project_dir("broken") / "project.json").unlink()
+            r = run("doctor", "--slug", "broken", "--no-repo")
+            self.assertIn("missing project.json", r.stdout)
+            self.assertNotIn("Unknown project", r.stderr)
+            r = run("txn", "broken")
+            self.assertNotIn("Unknown project", r.stderr)
+        finally:
+            reg = core.registry()
+            reg["projects"].pop("broken", None)
+            core.save_registry(reg)
+            shutil.rmtree(core.project_dir("broken"), ignore_errors=True)
+
+    def test_allocate_never_exceeds_budget(self):
+        import random
+        from aimem import context
+        rnd = random.Random(7)
+        for _ in range(3000):
+            secs = []
+            for i in range(rnd.randint(1, 13)):
+                body = "\n".join("x" * rnd.randint(0, 120) for _ in range(rnd.randint(1, 80))) + "y"
+                secs.append({"title": f"S{i}", "body": body, "authority": "A", "priority": rnd.randint(1, 13),
+                             "cap": rnd.choice([0.08, 0.1, 0.15, 0.25, 0.5]), "keep_tail": rnd.random() < 0.4})
+            budget = rnd.randint(0, 20000)
+            out = "".join(context.allocate(secs, budget))
+            self.assertLessEqual(len(out), budget)
+
+    def test_txn_discard_is_explicit_and_journaled(self):
+        t = txn.Transaction("hard")
+        t.stage(self.p / "NEXT.md", "STALE\n")
+        t._record("PREPARED")
+        before = (self.p / "NEXT.md").read_text()
+        r = run("txn", "hard", "--discard", t.id)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"TXN_DISCARDED={t.id}", r.stdout)
+        self.assertEqual(txn.pending("hard"), [])
+        self.assertEqual((self.p / "NEXT.md").read_text(), before)
+        self.assertFalse(list(self.p.glob(".NEXT.md.*.staged")))
+        self.assertEqual(run("txn", "hard", "--discard", "nope").returncode, 2)
+
+    def test_backup_with_external_symlink_and_hardlink_verifies(self):
+        from aimem import backup
+        ext = _isolation.SANDBOX / "outside-target.txt"
+        ext.write_text("outside")
+        link = self.p / "artifacts" / "external-link.txt"
+        hard = self.p / "artifacts" / "hardlinked.txt"
+        link.parent.mkdir(exist_ok=True)
+        (self.p / "artifacts" / "orig.txt").write_text("same inode")
+        try:
+            os.symlink(ext, link)
+            os.link(self.p / "artifacts" / "orig.txt", hard)
+            out = _isolation.SANDBOX / "backups"
+            tarball = backup.create(out, "linktest")
+            meta = json.loads(backup.sidecar(tarball, "meta.json").read_text())
+            self.assertIn("AI-Memory/projects/hard/artifacts/external-link.txt", meta["skipped_external_symlinks"])
+            rep = backup.verify(tarball)
+            self.assertEqual(rep["result"], "PASS", rep)
+        finally:
+            for f in (link, hard, self.p / "artifacts" / "orig.txt"):
+                if f.is_symlink() or f.exists():
+                    f.unlink()
+
+    def test_session_record_without_id_does_not_break_recovery_scans(self):
+        from aimem import recover
+        sid = "20250101T000000+0000-other-noid00"
+        core.atomic_write_json(sessions.session_file("hard", sid), {"status": "OPEN", "started_at": "2025-01-01T00:00:00+00:00"})
+        try:
+            ids = [a["id"] for a in recover.scan("hard")]
+            self.assertIn(sid, ids)
+            self.assertEqual(run("sessions", "hard").returncode, 0)
+            self.assertEqual(core.version_tuple("V3.1.1"), (3, 1, 1))
+        finally:
+            sessions.session_file("hard", sid).unlink()
+
+
 if __name__ == "__main__":
     unittest.main()
