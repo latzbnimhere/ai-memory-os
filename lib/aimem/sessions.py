@@ -18,11 +18,11 @@ def sessions_dir(slug):
 
 
 def session_file(slug, sid):
-    return sessions_dir(slug) / f"{sid}.json"
+    return sessions_dir(slug) / f"{core.safe_component(sid, 'session')}.json"
 
 
 def steps_file(slug, sid):
-    return sessions_dir(slug) / f"{sid}.steps.jsonl"
+    return sessions_dir(slug) / f"{core.safe_component(sid, 'session')}.steps.jsonl"
 
 
 def load_session(slug, sid):
@@ -97,17 +97,20 @@ def last_step(slug, sid):
 
 
 def touch_heartbeat(slug, sid, note=None):
+    """Refresh an OPEN session's lease. Serialized with finish/close so a heartbeat that
+    read the session before it was closed can never write it back as OPEN."""
     f = session_file(slug, sid)
-    j = load_json(f, {}) or {}
-    if j.get("status") != "OPEN":
-        core.die(f"session is not OPEN: {sid}")
-    lease = j.setdefault("lease", {})
-    lease["last_heartbeat"] = iso()
-    lease["heartbeats"] = int(lease.get("heartbeats", 0)) + 1
-    if note:
-        lease["last_note"] = core.redact(note, 300)
-    lease["state"] = "ACTIVE"
-    atomic_write_json(f, j)
+    with core.project_session_lock(slug):
+        j = load_json(f, {}) or {}
+        if j.get("status") != "OPEN":
+            core.die(f"session is not OPEN: {sid}")
+        lease = j.setdefault("lease", {})
+        lease["last_heartbeat"] = iso()
+        lease["heartbeats"] = int(lease.get("heartbeats", 0)) + 1
+        if note:
+            lease["last_note"] = core.redact(note, 300)
+        lease["state"] = "ACTIVE"
+        atomic_write_json(f, j)
     return j
 
 
@@ -167,42 +170,76 @@ def begin(slug, agent, task, tokens=None, mode="smart"):
 
 # ---------------------------------------------------------------- checkpoint
 
-def create_checkpoint(slug, label, result, summary="", session_id=None, advance_current=True, expect_version=None):
+def scan_canonical_secrets(slug, allow_secret_pattern=False):
+    """Refuse to seal secrets into immutable checkpoints (same policy as write-current)."""
     p = project_dir(slug)
-    cur, nxt = p / "CURRENT.md", p / "NEXT.md"
-    if not cur.exists():
-        core.die(f"{slug}: CURRENT.md missing")
-    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-")[:90] or "checkpoint"
+    for name in ("CURRENT.md", "NEXT.md"):
+        f = p / name
+        hits = core.secret_hits(f) if f.exists() else []
+        if hits and not allow_secret_pattern:
+            core.die(f"SECRET_PATTERN_REJECTED in {name}: {', '.join(hits)}. Checkpoints are immutable; remove the "
+                     f"credential from {name} (or pass --allow-secret-pattern if this is a verified false positive).")
+
+
+def _allocate_checkpoint_dir(p, label):
+    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-.")[:90] or "checkpoint"
     base_id = f"{stamp()}__{safe_label}"
     cp_id = base_id
     for n in range(2, 1000):  # unique even when concurrent checkpoints share a second and a label
         cpd = p / "checkpoints" / cp_id
         try:
             cpd.mkdir(parents=True)
-            break
+            return cp_id, cpd
         except FileExistsError:
             cp_id = f"{base_id}-{n}"
-    else:
-        core.die("could not allocate a unique checkpoint id")
-    shutil.copy2(cur, cpd / "CURRENT.md")
-    if nxt.exists():
-        shutil.copy2(nxt, cpd / "NEXT.md")
-    repo_state = core.repo_state_for(slug)
-    atomic_write_json(cpd / "REPO_STATE.json", repo_state)
-    meta = {
-        "id": cp_id, "time": iso(), "label": label, "result": result, "summary": core.redact(summary, 4000),
-        "session_id": session_id, "advances_current_checkpoint": bool(advance_current),
-        "current_sha256": sha256_file(cur), "next_sha256": sha256_file(nxt) if nxt.exists() else None,
-        "repo_state": repo_state, "engine_version": core.VERSION,
-    }
-    atomic_write_json(cpd / "meta.json", meta)
-    patch = {"current_checkpoint": cp_id} if advance_current else {}
-    version, txid = txn.canonical_update(
-        slug, {p / "REPO_STATE.json": core.dumps(repo_state)}, session=session_id, expect_version=expect_version,
-        kind="checkpoint", manifest_patch=patch)
-    meta["memory_version"] = version
-    meta["txn"] = txid
-    atomic_write_json(cpd / "meta.json", meta)
+    core.die("could not allocate a unique checkpoint id")
+
+
+def create_checkpoint(slug, label, result, summary="", session_id=None, advance_current=True, expect_version=None,
+                      allow_secret_pattern=False):
+    """Seal CURRENT/NEXT + fresh repo state into an immutable checkpoint and bump memory_version.
+
+    Everything that must agree (CAS check, snapshot of CURRENT/NEXT, meta.json, REPO_STATE.json,
+    project.json) happens under the project write lock, and meta.json is committed by the same
+    transaction as project.json. A CAS conflict or pending transaction is detected BEFORE the
+    checkpoint directory is created, so a refused checkpoint leaves nothing behind.
+    """
+    p = project_dir(slug)
+    cur, nxt = p / "CURRENT.md", p / "NEXT.md"
+    if not cur.exists():
+        core.die(f"{slug}: CURRENT.md missing")
+    repo_state = core.repo_state_for(slug)  # physical state: gathered outside the lock (git can be slow)
+    with core.project_write_lock(slug):
+        scan_canonical_secrets(slug, allow_secret_pattern)
+        txn.require_no_pending(slug)
+        actual = txn.check_version(slug, expect_version)
+        cp_id, cpd = _allocate_checkpoint_dir(p, label)
+        committed = False
+        txid = None
+        try:
+            shutil.copy2(cur, cpd / "CURRENT.md")
+            if nxt.exists():
+                shutil.copy2(nxt, cpd / "NEXT.md")
+            atomic_write_json(cpd / "REPO_STATE.json", repo_state)
+            txid = txn.new_txn_id()
+            version = actual + 1
+            meta = {
+                "id": cp_id, "time": iso(), "label": label, "result": result, "summary": core.redact(summary, 4000),
+                "session_id": session_id, "advances_current_checkpoint": bool(advance_current),
+                "current_sha256": sha256_file(cpd / "CURRENT.md"),
+                "next_sha256": sha256_file(cpd / "NEXT.md") if (cpd / "NEXT.md").exists() else None,
+                "repo_state": repo_state, "engine_version": core.VERSION, "memory_version": version, "txn": txid,
+            }
+            patch = {"current_checkpoint": cp_id} if advance_current else {}
+            version, txid = txn.canonical_update_locked(
+                slug, {p / "REPO_STATE.json": core.dumps(repo_state), cpd / "meta.json": core.dumps(meta)},
+                session=session_id, expect_version=actual, kind="checkpoint", manifest_patch=patch, txn_id=txid)
+            committed = True
+        finally:
+            # Never leave a half-built, unreferenced checkpoint behind. The one exception is a transaction
+            # interrupted mid-commit: its record stays pending and may still roll meta.json forward into cpd.
+            if not committed and not (txid and any(t.get("id") == txid for t in txn.pending(slug))):
+                shutil.rmtree(cpd, ignore_errors=True)
     append_jsonl(p / "EVENTS.jsonl", {"time": iso(), "kind": "checkpoint", **meta})
     provenance.record_fact(slug, "checkpoint.current" if advance_current else "checkpoint.admin", cp_id, "CHECKPOINT",
                            source_ref=str(cpd / "meta.json"), status="VERIFIED", session=session_id,
@@ -220,9 +257,20 @@ def create_checkpoint(slug, label, result, summary="", session_id=None, advance_
 
 
 def finish(slug, session=None, result="", label=None, summary="", allow_unchanged=False,
-           no_advance_current=False, expect_version=None, acknowledge_newer=False):
+           no_advance_current=False, expect_version=None, acknowledge_newer=False, allow_secret_pattern=False):
+    """Checkpoint + close. Serialized per project with heartbeat/close (session lock), so a session
+    can be finished exactly once and a concurrent heartbeat cannot resurrect it."""
     from . import index as indexmod
     core.ensure_root()
+    with core.project_session_lock(slug):
+        cp_id, version = _finish_locked(slug, session, result, label, summary, allow_unchanged, no_advance_current,
+                                        expect_version, acknowledge_newer, allow_secret_pattern)
+    indexmod.reindex(slug, quiet=True)
+    return cp_id, version
+
+
+def _finish_locked(slug, session, result, label, summary, allow_unchanged, no_advance_current, expect_version,
+                   acknowledge_newer, allow_secret_pattern):
     p = project_dir(slug)
     if session:
         sf = session_file(slug, session)
@@ -254,36 +302,40 @@ def finish(slug, session=None, result="", label=None, summary="", allow_unchange
                 f"--expect-version {actual_version}.", core.EXIT_CONFLICT)
         expect_version = actual_version
     lbl = label or state.get("task") or "session finish"
-    cp_id, version = create_checkpoint(slug, lbl, result, summary, state.get("id"), not no_advance_current, expect_version)
+    cp_id, version = create_checkpoint(slug, lbl, result, summary, state.get("id"), not no_advance_current, expect_version,
+                                       allow_secret_pattern)
     state["status"] = "CLOSED"
     state["finished_at"] = iso()
     state["result"] = result
     state["summary"] = core.redact(summary, 4000)
     state["checkpoint"] = cp_id
-    state["end_current_sha256"] = end_sha
+    sealed = try_load_json(p / "checkpoints" / cp_id / "meta.json", {}) or {}
+    state["end_current_sha256"] = sealed.get("current_sha256") or end_sha
     state["end_memory_version"] = version
     state["end_repo_state"] = core.repo_state_for(slug)
     state.setdefault("lease", {})["state"] = "CLOSED"
     atomic_write_json(sf, state)
     append_jsonl(p / "EVENTS.jsonl", {"time": iso(), "kind": "session_finish", "session_id": state.get("id"),
                                        "result": result, "checkpoint": cp_id, "memory_version": version})
-    indexmod.reindex(slug, quiet=True)
     return cp_id, version
 
 
 def close_session(slug, sid, result="ABANDONED", note=""):
     """Close an OPEN session WITHOUT a checkpoint (administrative; no canonical change)."""
     sf = session_file(slug, sid)
-    state = load_json(sf, {}) or {}
-    if state.get("status") != "OPEN":
-        core.die(f"Session is not OPEN: {sid}")
-    state["status"] = "CLOSED"
-    state["finished_at"] = iso()
-    state["result"] = result
-    state["closed_administratively"] = True
-    state["close_note"] = core.redact(note, 1000)
-    state.setdefault("lease", {})["state"] = "CLOSED"
-    atomic_write_json(sf, state)
+    with core.project_session_lock(slug):
+        if not sf.exists():
+            core.die(f"Session not found: {sid}")
+        state = load_json(sf, {}) or {}
+        if state.get("status") != "OPEN":
+            core.die(f"Session is not OPEN: {sid}")
+        state["status"] = "CLOSED"
+        state["finished_at"] = iso()
+        state["result"] = result
+        state["closed_administratively"] = True
+        state["close_note"] = core.redact(note, 1000)
+        state.setdefault("lease", {})["state"] = "CLOSED"
+        atomic_write_json(sf, state)
     append_jsonl(project_dir(slug) / "EVENTS.jsonl", {"time": iso(), "kind": "session_closed_admin", "session_id": sid,
                                                        "result": result, "note": state["close_note"]})
     return state

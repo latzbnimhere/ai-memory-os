@@ -72,7 +72,8 @@ SECRET_PATTERNS = [
     ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
     ("Bearer header", re.compile(r"(?i)\bauthorization:\s*bearer\s+[A-Za-z0-9._-]{16,}")),
     ("Cookie header", re.compile(r"(?i)\b(?:set-)?cookie:\s*\S{16,}")),
-    ("Password assignment", re.compile(r"(?i)\b(password|passwd|pwd)\s*[:=]\s*['\"]?[^\s'\"]{6,}")),
+    # values starting with / ~ . are paths (e.g. "pwd=/repo"), not credentials
+    ("Password assignment", re.compile(r"(?i)\b(password|passwd|pwd)\s*[:=]\s*['\"]?(?![/~.])[^\s'\"]{6,}")),
 ]
 REDACT_RX = [
     re.compile(r"(?i)\b(password|passwd|secret|token|api[_-]?key|authorization|cookie)\s*[:=]\s*\S+"),
@@ -83,6 +84,10 @@ REDACT_RX = [
     re.compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
 ]
+
+# High-confidence credential shapes only: safe to apply to whole generated documents
+# (context packs) without mangling ordinary prose such as "token budget: 3600".
+REDACT_HIGH_CONFIDENCE_RX = [rx for _label, rx in SECRET_PATTERNS if _label != "Password assignment"]
 
 # ---------------------------------------------------------------- time
 
@@ -126,6 +131,23 @@ class AimemError(SystemExit):
 
 def die(msg, code=EXIT_ERROR):
     raise AimemError(msg, code)
+
+
+# ---------------------------------------------------------------- path safety
+
+
+def safe_component(value, what="name"):
+    """Validate a single path component taken from user/agent input (slug, session id).
+
+    Rejects anything that could escape its parent directory or hide from listings:
+    empty, '.'/'..', leading dot, path separators, NUL/control characters, over-long.
+    Returns the value unchanged when safe; fails closed (EXIT_ERROR) otherwise.
+    """
+    v = "" if value is None else str(value)
+    if (not v or v in (".", "..") or v.startswith(".") or "/" in v or "\\" in v or len(v) > 200
+            or any(ord(c) < 32 or ord(c) == 127 for c in v)):
+        die(f"UNSAFE_{what.upper()}: {v!r} is not a valid {what} (no path separators, no leading dot, no control characters)")
+    return v
 
 
 # ---------------------------------------------------------------- json / io
@@ -194,18 +216,31 @@ def atomic_write_json(path: Path, obj):
 
 
 def append_jsonl(path: Path, obj):
-    """Append one JSON line; exclusive lock on the file, fsync."""
+    """Append one JSON line; exclusive lock on the file, fsync.
+
+    Crash safety: if a previous writer died mid-line (file does not end in a newline),
+    a newline is written first so the torn fragment stays an isolated, detectable bad
+    line (see `aimem doctor`) instead of silently corrupting this record as well.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n"
-    with path.open("a", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    data = (json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
+            size = os.fstat(fd).st_size
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                data = b"\n" + data
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+            os.fsync(fd)
         finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def read_jsonl(path: Path, limit=None):
@@ -226,12 +261,43 @@ def read_jsonl(path: Path, limit=None):
     return out
 
 
-def read_tail(path: Path, n):
+def tail_lines(path: Path, n, block=65536):
+    """Last n lines of a file without reading the whole file (journals can be huge)."""
     p = Path(path)
-    if not p.exists():
-        return ""
-    lines = p.read_text(errors="ignore").splitlines()
-    return "\n".join(lines[-n:])
+    if n <= 0 or not p.exists():
+        return []
+    with p.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        buf = b""
+        pos = end
+        while pos > 0 and buf.count(b"\n") <= n:
+            step = min(block, pos)
+            pos -= step
+            f.seek(pos)
+            buf = f.read(step) + buf
+    lines = buf.decode("utf-8", errors="ignore").splitlines()
+    if pos > 0 and lines:
+        lines = lines[1:]  # first line may be partial
+    return lines[-n:]
+
+
+def read_tail(path: Path, n):
+    return "\n".join(tail_lines(path, n))
+
+
+def tail_jsonl(path: Path, n):
+    """Last n parseable JSON records (malformed lines skipped)."""
+    out = []
+    for line in tail_lines(path, n):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
 
 
 def sha256_file(path: Path):
@@ -284,18 +350,24 @@ def installed_version():
 
 
 class LockTimeout(AimemError):
-    def __init__(self, name, timeout):
-        super().__init__(f"LOCK_TIMEOUT: could not acquire lock '{name}' within {timeout}s (another agent holds it); failing closed.", EXIT_LOCK_TIMEOUT)
+    def __init__(self, name, timeout, holder=""):
+        extra = f" last_holder={holder}" if holder else ""
+        super().__init__(f"LOCK_TIMEOUT: could not acquire lock '{name}' within {timeout}s (another agent holds it); failing closed.{extra}", EXIT_LOCK_TIMEOUT)
 
 
 @contextlib.contextmanager
 def lock(name="global", timeout=None):
-    """Exclusive advisory lock with bounded wait; fails closed on timeout."""
+    """Exclusive advisory lock with bounded wait; fails closed on timeout.
+
+    flock locks are released by the kernel when the holding process dies, so a crashed
+    agent never leaves a stale lock behind; the lock file itself is only a rendezvous
+    point (it records the last holder for diagnostics). Locks are NOT re-entrant.
+    """
     ensure_root()
     if timeout is None:
         timeout = config().get("lock_timeout_s", 20)
     p = LOCKS / f"{name}.lock"
-    f = p.open("w")
+    f = p.open("a+")
     deadline = time.time() + float(timeout)
     acquired = False
     try:
@@ -306,8 +378,20 @@ def lock(name="global", timeout=None):
                 break
             except OSError:
                 if time.time() >= deadline:
-                    raise LockTimeout(name, timeout)
+                    try:
+                        f.seek(0)
+                        holder = f.read(300).strip()
+                    except Exception:
+                        holder = ""
+                    raise LockTimeout(name, timeout, holder)
                 time.sleep(0.05)
+        try:
+            f.seek(0)
+            f.truncate()
+            f.write(json.dumps({"pid": os.getpid(), "since": iso(), "argv": " ".join(sys.argv[1:4])[:120]}) + "\n")
+            f.flush()
+        except Exception:
+            pass
         yield
     finally:
         if acquired:
@@ -326,6 +410,15 @@ def project_step_lock(slug, timeout=None):
     return lock(f"{slug}.step", timeout)
 
 
+def project_session_lock(slug, timeout=None):
+    """Serializes read-modify-write of session state files (heartbeat, finish, close).
+
+    Lock order: session lock -> write lock. Never acquire the session lock while
+    holding the write lock.
+    """
+    return lock(f"{slug}.session", timeout)
+
+
 # ---------------------------------------------------------------- registry / projects
 
 
@@ -341,7 +434,7 @@ def save_registry(d):
 
 
 def project_dir(slug):
-    return PROJECTS / slug
+    return PROJECTS / safe_component(slug, "slug")
 
 
 def project_exists(slug):
@@ -359,7 +452,8 @@ def all_slugs():
     return sorted(registry()["projects"])
 
 
-def detect_project(cwd):
+def detect_candidates(cwd):
+    """All registered projects whose repo contains cwd, most specific (longest repo path) first."""
     reg = try_load_json(REGISTRY, {"projects": {}}) or {"projects": {}}
     target = Path(cwd).expanduser()
     try:
@@ -381,9 +475,21 @@ def detect_project(cwd):
             matches.append((len(str(rp)), slug))
         except ValueError:
             pass
+    matches.sort(key=lambda m: (-m[0], m[1]))
+    return matches
+
+
+def detect_project(cwd):
+    """Most specific registered project for cwd; None when unregistered OR ambiguous.
+
+    Two slugs registered for the same repo path is ambiguous: fail closed rather than
+    silently binding an agent to whichever slug sorts last.
+    """
+    matches = detect_candidates(cwd)
     if not matches:
         return None
-    matches.sort(reverse=True)
+    if len(matches) > 1 and matches[0][0] == matches[1][0]:
+        return None
     return matches[0][1]
 
 
@@ -462,6 +568,14 @@ def secret_hits(path: Path):
         return secret_hits_text(Path(path).read_text(errors="ignore"))
     except Exception:
         return []
+
+
+def redact_high_confidence(text):
+    """Redact only unmistakable credential shapes (keys, tokens, private-key headers)."""
+    out = text or ""
+    for rx in REDACT_HIGH_CONFIDENCE_RX:
+        out = rx.sub("[REDACTED_SECRET]", out)
+    return out
 
 
 def redact(value, limit=4000):

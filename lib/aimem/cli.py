@@ -68,8 +68,8 @@ def cmd_register(a):
     from . import index
     core.ensure_root()
     slug = a.slug
-    if not slug or any(c for c in slug if not (c.isalnum() or c in "-_")):
-        die("slug must be alphanumeric with - or _")
+    if not slug or any(c for c in slug if not (c.isalnum() or c in "-_")) or len(slug) > 120:
+        die("slug must be alphanumeric with - or _ (max 120 chars)")
     repo = (a.repo or "").strip()
     if repo and core.recursive_index_risk(repo):
         die(f"RECURSIVE_INDEX_RISK: {repo} overlaps the memory root {ROOT}; refusing to register.")
@@ -168,7 +168,7 @@ def cmd_heartbeat(a):
 def cmd_finish(a):
     from . import sessions
     cp, version = sessions.finish(a.slug, a.session, a.result, a.label, a.summary or "", a.allow_unchanged, a.no_advance_current,
-                                  a.expect_version, a.acknowledge_newer)
+                                  a.expect_version, a.acknowledge_newer, a.allow_secret_pattern)
     print("FINISH=PASS")
     print(f"CHECKPOINT={cp}")
     print(f"MEMORY_VERSION={version}")
@@ -177,7 +177,8 @@ def cmd_finish(a):
 def cmd_checkpoint(a):
     from . import sessions
     core.ensure_root()
-    cp, version = sessions.create_checkpoint(a.slug, a.label, a.result, a.summary or "", a.session, not a.no_advance_current, a.expect_version)
+    cp, version = sessions.create_checkpoint(a.slug, a.label, a.result, a.summary or "", a.session, not a.no_advance_current, a.expect_version,
+                                             a.allow_secret_pattern)
     from . import index
     index.reindex(a.slug, quiet=True)
     print(cp)
@@ -566,8 +567,8 @@ def build_parser():
 
     p = sp.add_parser("begin"); p.add_argument("slug"); p.add_argument("--agent", choices=AGENTS, required=True); p.add_argument("--task", required=True); p.add_argument("--tokens", type=int); p.add_argument("--mode", choices=["hot", "smart", "deep"], default="smart"); p.set_defaults(func=cmd_begin)
     p = sp.add_parser("heartbeat"); p.add_argument("slug"); p.add_argument("--session"); p.add_argument("--note"); p.set_defaults(func=cmd_heartbeat)
-    p = sp.add_parser("finish"); p.add_argument("slug"); p.add_argument("--session"); p.add_argument("--result", required=True); p.add_argument("--label"); p.add_argument("--summary"); p.add_argument("--allow-unchanged", action="store_true"); p.add_argument("--no-advance-current", action="store_true"); p.add_argument("--expect-version", type=int); p.add_argument("--acknowledge-newer", action="store_true", help="finish even though another session advanced memory (you merged it)"); p.set_defaults(func=cmd_finish)
-    p = sp.add_parser("checkpoint"); p.add_argument("slug"); p.add_argument("--label", required=True); p.add_argument("--result", required=True); p.add_argument("--summary"); p.add_argument("--session"); p.add_argument("--no-advance-current", action="store_true"); p.add_argument("--expect-version", type=int); p.set_defaults(func=cmd_checkpoint)
+    p = sp.add_parser("finish"); p.add_argument("slug"); p.add_argument("--session"); p.add_argument("--result", required=True); p.add_argument("--label"); p.add_argument("--summary"); p.add_argument("--allow-unchanged", action="store_true"); p.add_argument("--no-advance-current", action="store_true"); p.add_argument("--expect-version", type=int); p.add_argument("--acknowledge-newer", action="store_true", help="finish even though another session advanced memory (you merged it)"); p.add_argument("--allow-secret-pattern", action="store_true", help="seal even though CURRENT/NEXT match a secret pattern (verified false positive)"); p.set_defaults(func=cmd_finish)
+    p = sp.add_parser("checkpoint"); p.add_argument("slug"); p.add_argument("--label", required=True); p.add_argument("--result", required=True); p.add_argument("--summary"); p.add_argument("--session"); p.add_argument("--no-advance-current", action="store_true"); p.add_argument("--expect-version", type=int); p.add_argument("--allow-secret-pattern", action="store_true"); p.set_defaults(func=cmd_checkpoint)
     p = sp.add_parser("sessions"); p.add_argument("slug", nargs="?"); p.add_argument("--open", action="store_true"); p.set_defaults(func=cmd_sessions)
     p = sp.add_parser("session"); p.add_argument("action", choices=["close", "show"]); p.add_argument("slug"); p.add_argument("--session"); p.add_argument("--result", default="ABANDONED"); p.add_argument("--note"); p.set_defaults(func=cmd_session)
     p = sp.add_parser("write-current", help="transactional CAS write of CURRENT.md/NEXT.md from files"); p.add_argument("slug"); p.add_argument("--current"); p.add_argument("--next"); p.add_argument("--session"); p.add_argument("--expect-version", type=int); p.add_argument("--allow-secret-pattern", action="store_true"); p.set_defaults(func=cmd_write_current)
@@ -604,9 +605,19 @@ def build_parser():
     return ap
 
 
+# Commands whose positional slug may name a project that does not exist yet.
+_SLUG_MAY_BE_NEW = {"register"}
+
+
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
+    slug = getattr(args, "slug", None)
+    if slug and args.cmd not in _SLUG_MAY_BE_NEW:
+        # Fail closed before any command can create stray directories/journals for a typo'd or unsafe slug.
+        core.ensure_root()
+        if not core.project_exists(slug):
+            die(f"Unknown project: {slug} (registered: {', '.join(core.all_slugs()) or 'none'})")
     args.func(args)
 
 

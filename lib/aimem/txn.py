@@ -14,6 +14,11 @@ Recovery rules (deterministic):
   COMMITTING : partially applied. Roll forward remaining staged files (those still
                present are the un-applied ones). Never roll back (would lose applied data).
   COMMITTED  : finalize (remove record).
+Roll-forward is refused (MANUAL review) when a target no longer holds its recorded
+pre-image: something rewrote it after the interruption, and blindly applying the old
+staged content would destroy newer data.
+While any transaction is pending, new canonical updates fail closed (exit 4) so that a
+later repair can never roll stale staged content over newer state.
 Read-only inspection never mutates; repair must be explicit.
 """
 from __future__ import annotations
@@ -31,12 +36,16 @@ def txn_dir(slug):
     return project_dir(slug) / ".txn"
 
 
+def new_txn_id():
+    return f"{stamp()}-{uuid.uuid4().hex[:8]}"
+
+
 class Transaction:
-    def __init__(self, slug, kind="canonical_update", session=None):
+    def __init__(self, slug, kind="canonical_update", session=None, txn_id=None):
         self.slug = slug
         self.kind = kind
         self.session = session
-        self.id = f"{stamp()}-{uuid.uuid4().hex[:8]}"
+        self.id = txn_id or new_txn_id()
         self.entries = []  # dicts: target, staged, pre_sha256, validate
         self.record_path = txn_dir(slug) / f"{self.id}.json"
         self.state = "NEW"
@@ -128,6 +137,17 @@ def pending(slug):
     return out
 
 
+def _target_state(e):
+    """'PRE' if target still holds its pre-image, 'NEW' if it already holds the new content, else 'CHANGED'."""
+    t = Path(e["target"])
+    cur = sha256_file(t) if t.exists() else None
+    if cur == e.get("pre_sha256"):
+        return "PRE"
+    if cur is not None and cur == e.get("new_sha256"):
+        return "NEW"
+    return "CHANGED"
+
+
 def inspect(slug):
     """Read-only classification of pending transactions."""
     report = []
@@ -137,10 +157,16 @@ def inspect(slug):
         staged_present = [e for e in entries if os.path.exists(e["staged"])]
         item = {"id": rec.get("id"), "state": state, "kind": rec.get("kind"), "session": rec.get("session"),
                 "targets": [e["target"] for e in entries], "staged_present": len(staged_present), "path": rec.get("path")}
+        changed = [e["target"] for e in staged_present if _target_state(e) == "CHANGED"]
+        if changed:
+            item["targets_changed_since_prepare"] = changed
         if state == "PREPARED":
-            item["resolution"] = "ROLL_FORWARD" if len(staged_present) == len(entries) and entries else "ROLL_BACK"
+            if not (len(staged_present) == len(entries) and entries):
+                item["resolution"] = "ROLL_BACK"
+            else:
+                item["resolution"] = "MANUAL_TARGET_CHANGED" if changed else "ROLL_FORWARD"
         elif state == "COMMITTING":
-            item["resolution"] = "ROLL_FORWARD"
+            item["resolution"] = "MANUAL_TARGET_CHANGED" if changed else "ROLL_FORWARD"
         elif state == "COMMITTED":
             item["resolution"] = "FINALIZE"
         else:
@@ -182,6 +208,11 @@ def repair(slug):
                 if not ok:
                     actions.append((rid, "STAGED_CONTENT_INVALID_MANUAL_REVIEW"))
                     continue
+                if any(_target_state(e) == "CHANGED" for e in present):
+                    # Newer content was written over a target after the interruption; applying the
+                    # stale staged copy would destroy it. Leave everything in place for a human.
+                    actions.append((rid, "TARGET_CHANGED_SINCE_PREPARE_MANUAL_REVIEW"))
+                    continue
                 for e in present:
                     os.replace(e["staged"], e["target"])
                     core._fsync_dir(Path(e["target"]).parent)
@@ -206,32 +237,62 @@ class VersionConflict(core.AimemError):
             core.EXIT_CONFLICT)
 
 
-def canonical_update(slug, files: dict, session=None, expect_version=None, kind="canonical_update", manifest_patch=None):
+def require_no_pending(slug):
+    """Fail closed (exit 4) while an interrupted transaction is unresolved.
+
+    Writing on top of a half-applied transaction would let a later roll-forward
+    overwrite the newer state with stale staged content.
+    """
+    pend = pending(slug)
+    if pend:
+        core.die(f"UNRESOLVED_TRANSACTIONS: {slug} has {len(pend)} interrupted transaction(s) "
+                 f"({', '.join(str(t.get('id')) for t in pend[:3])}); inspect with `aimem txn {slug}` and "
+                 f"resolve with `aimem txn {slug} --repair` before writing canonical state.", core.EXIT_RECOVERY_REQUIRED)
+
+
+def check_version(slug, expect_version):
+    """Current memory_version; raises VersionConflict when expect_version is given and differs."""
+    actual = int(core.project_manifest(slug).get("memory_version", 0))
+    if expect_version is not None and int(expect_version) != actual:
+        raise VersionConflict(slug, expect_version, actual)
+    return actual
+
+
+def canonical_update_locked(slug, files: dict, session=None, expect_version=None, kind="canonical_update",
+                            manifest_patch=None, txn_id=None):
+    """canonical_update for callers that already hold project_write_lock(slug)."""
+    p = project_dir(slug)
+    require_no_pending(slug)
+    man = core.project_manifest(slug)
+    actual = check_version(slug, expect_version)
+    man["memory_version"] = actual + 1
+    man["updated_at"] = iso()
+    man["last_writer_session"] = session
+    if manifest_patch:
+        man.update(manifest_patch)
+    t = Transaction(slug, kind=kind, session=session, txn_id=txn_id)
+    try:
+        for path, text in files.items():
+            path = Path(path)
+            validate = core.validate_json_file if path.suffix == ".json" else None
+            t.stage(path, text, validate=validate)
+        t.stage_json(p / "project.json", man)
+        t.commit()
+    except BaseException:
+        if t.state in ("NEW", "PREPARED"):
+            t.abort()  # nothing applied yet: clean rollback
+        # COMMITTING/COMMITTED: some targets may already be replaced; keep the record so
+        # `aimem txn --repair` can deterministically roll forward.
+        raise
+    return man["memory_version"], t.id
+
+
+def canonical_update(slug, files: dict, session=None, expect_version=None, kind="canonical_update", manifest_patch=None,
+                     txn_id=None):
     """Atomically write several canonical files + bump project.json memory_version.
 
     files: {Path: text}. Compare-and-swap on memory_version when expect_version is given.
-    Must be called under project_write_lock (acquired here).
+    Acquires project_write_lock (not re-entrant: use canonical_update_locked if already held).
     """
-    p = project_dir(slug)
     with core.project_write_lock(slug):
-        man = core.project_manifest(slug)
-        actual = int(man.get("memory_version", 0))
-        if expect_version is not None and int(expect_version) != actual:
-            raise VersionConflict(slug, expect_version, actual)
-        man["memory_version"] = actual + 1
-        man["updated_at"] = iso()
-        man["last_writer_session"] = session
-        if manifest_patch:
-            man.update(manifest_patch)
-        t = Transaction(slug, kind=kind, session=session)
-        try:
-            for path, text in files.items():
-                path = Path(path)
-                validate = core.validate_json_file if path.suffix == ".json" else None
-                t.stage(path, text, validate=validate)
-            t.stage_json(p / "project.json", man)
-            t.commit()
-        except BaseException:
-            t.abort()
-            raise
-        return man["memory_version"], t.id
+        return canonical_update_locked(slug, files, session, expect_version, kind, manifest_patch, txn_id)
