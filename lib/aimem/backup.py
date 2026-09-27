@@ -100,19 +100,33 @@ def safe_extract(tf, dest):
     if bad:
         raise UnsafeArchive(f"refusing {len(bad)} unsafe member(s), e.g. {bad[:3]}")
     dest = str(dest)
+    dirs = []
     for m in tf.getmembers():
         target = os.path.join(dest, m.name)
         if not _within(os.path.dirname(target), dest):
             raise UnsafeArchive(f"member would be written outside the target: {m.name}")
         if os.path.lexists(target) and not (m.isdir() and os.path.isdir(target) and not os.path.islink(target)):
             raise UnsafeArchive(f"member would overwrite an existing path: {m.name}")
+        # Like extractall: directory attributes are applied only after all members are extracted, so a
+        # directory archived without write/execute permission cannot block extracting its own content.
+        set_attrs = not m.isdir()
         try:
-            tf.extract(m, dest, filter="data")
+            tf.extract(m, dest, set_attrs=set_attrs, filter="data")
         except TypeError:  # Python without extraction filters
-            tf.extract(m, dest)
+            tf.extract(m, dest, set_attrs=set_attrs)
+        if m.isdir():
+            dirs.append((target, m))
         if (m.issym() or m.islnk()) and not _within(target, dest):
             os.unlink(target)
             raise UnsafeArchive(f"link resolves outside the target: {m.name}")
+    for target, m in sorted(dirs, key=lambda d: d[0], reverse=True):  # deepest first
+        try:
+            # group/other bits as archived, never setuid/setgid/sticky, and always owner rwx: a restored
+            # memory root must stay writable by its owner
+            os.chmod(target, (m.mode & 0o777) | 0o700)
+            os.utime(target, (m.mtime, m.mtime))
+        except OSError:
+            pass
 
 
 def backup_dir():

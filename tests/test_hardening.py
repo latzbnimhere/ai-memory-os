@@ -1126,7 +1126,30 @@ class TestBackupReviewFindings(Base):
         with self._no_filter(), tarfile.open(good) as tf:
             backup.safe_extract(tf, dest)
         self.assertEqual((dest / "AI-Memory/alias").read_text(), "{}")
+        # directory attributes are applied after the content (a 0o644 / 0o555 directory member must not
+        # block extracting its own children for a non-root user) and the owner always keeps rwx
+        self.assertEqual(os.stat(dest / "AI-Memory").st_mode & 0o700, 0o700)
         shutil.rmtree(dest)
+        ro = self._tar("readonly-dir.tar.gz", [("dir", "AI-Memory", None), ("dir", "AI-Memory/ro", None),
+                                               ("file", "AI-Memory/ro/inside.txt", b"data")])
+        import tarfile as _tf
+        with _tf.open(ro, "r:gz") as tf:  # mark the directory read-only in the archive
+            members = tf.getmembers()
+        for with_filter in (True, False):
+            dest.mkdir()
+            with _tf.open(ro, "r:gz") as tf:
+                for m in tf.getmembers():
+                    if m.isdir():
+                        m.mode = 0o555
+                if with_filter:
+                    backup.safe_extract(tf, dest)
+                else:
+                    with self._no_filter():
+                        backup.safe_extract(tf, dest)
+            self.assertEqual((dest / "AI-Memory/ro/inside.txt").read_text(), "data")
+            self.assertEqual(os.stat(dest / "AI-Memory/ro").st_mode & 0o700, 0o700)
+            shutil.rmtree(dest)
+        self.assertTrue(members)
 
     def _subroot(self, name):
         """A second, independent memory root driven through the CLI (restore replaces whole roots)."""
