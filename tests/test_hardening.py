@@ -326,7 +326,7 @@ class TestImportBackupMigrate(Base):
                 self.assertTrue(backup.unsafe_members(tf))
             rep = backup.verify(bad)
             self.assertEqual(rep["result"], "FAIL")
-            self.assertIn(("tar_paths_safe", "FAIL"), rep["checks"])
+            self.assertTrue(dict(rep["checks"])["tar_paths_safe"].startswith("FAIL"), rep["checks"])
         with tarfile.open(good) as tf:
             self.assertEqual(backup.unsafe_members(tf), [])
         self.assertFalse((_isolation.SANDBOX / "outside").exists())
@@ -598,9 +598,14 @@ class TestReviewFindings(Base):
             out = _isolation.SANDBOX / "backups"
             tarball = backup.create(out, "linktest")
             meta = json.loads(backup.sidecar(tarball, "meta.json").read_text())
-            self.assertIn("AI-Memory/projects/hard/artifacts/external-link.txt", meta["skipped_external_symlinks"])
-            rep = backup.verify(tarball)
+            reasons = {e["path"]: e["reason"] for e in meta["skipped_or_dereferenced"]}
+            self.assertIn("dereferenced", reasons["AI-Memory/projects/hard/artifacts/external-link.txt"])
+            rep = backup.verify(tarball, keep_temp=True)
             self.assertEqual(rep["result"], "PASS", rep)
+            restored = Path(rep["temp_kept"]) / "AI-Memory/projects/hard/artifacts/external-link.txt"
+            self.assertFalse(restored.is_symlink())
+            self.assertEqual(restored.read_text(), "outside")  # the external content itself was backed up
+            shutil.rmtree(rep["temp_kept"])
         finally:
             for f in (link, hard, self.p / "artifacts" / "orig.txt"):
                 if f.is_symlink() or f.exists():
@@ -967,7 +972,7 @@ class TestTransactionReviewFindings(Base):
         txn.repair("hard")
 
     def test_version_build_suffixes_are_never_downgraded(self):
-        for v in ("4.3.0", "5", "4.2.0+hotfix2", "4.2.0rc1", "4.2.0.1", "garbage", ""):
+        for v in ("4.3.0", "5", "4.2.0+hotfix2", "4.2.0rc1", "4.2.0" + ".1", "garbage", ""):
             self.assertTrue(core.version_not_older(v, "4.2.0"), v)
         for v in ("4.1.0", "V3.1.1", "2.0.0+V3.1.1", "4.2"):
             self.assertFalse(core.version_not_older(v, "4.2.0"), v)
@@ -1045,6 +1050,182 @@ class TestIndexReviewFindings(Base):
         self.assertIn("schema missing table(s) chunks_fts", r.stdout)
         self.assertEqual(run("doctor", "--no-repo", "--slug", "hard", "--repair").returncode, 0)
         self.assertEqual(index.db_health(), index.DB_OK)
+
+
+class TestBackupReviewFindings(Base):
+    """Regressions from the final adversarial review of backup/restore and link handling."""
+
+    def _tar(self, name, members):
+        import io
+        import tarfile
+        t = _isolation.SANDBOX / name
+        with tarfile.open(t, "w:gz") as tf:
+            for kind, mname, arg in members:
+                ti = tarfile.TarInfo(mname)
+                if kind == "file":
+                    ti.size = len(arg)
+                    tf.addfile(ti, io.BytesIO(arg))
+                elif kind == "dir":
+                    ti.type = tarfile.DIRTYPE
+                    tf.addfile(ti)
+                else:
+                    ti.type = tarfile.SYMTYPE if kind == "sym" else tarfile.LNKTYPE
+                    ti.linkname = arg
+                    tf.addfile(ti)
+        return t
+
+    def _no_filter(self):
+        """Simulate a Python without tarfile extraction filters (e.g. macOS system Python 3.9.6)."""
+        import tarfile
+        from unittest import mock
+        real = tarfile.TarFile.extract
+
+        def extract(self_, member, path="", set_attrs=True, **kw):
+            if "filter" in kw:
+                raise TypeError("extract() got an unexpected keyword argument 'filter'")
+            return real(self_, member, path, set_attrs=set_attrs)
+        return mock.patch.object(tarfile.TarFile, "extract", extract)
+
+    def test_symlink_chains_and_overwrites_never_escape(self):
+        import tarfile
+        from aimem import backup
+        outside = _isolation.SANDBOX / "victim.txt"
+        attacks = {
+            "chain": [("sym", "AI-Memory/s1", "."), ("sym", "AI-Memory/s1/s2", "."), ("sym", "AI-Memory/s1/s2/esc", "../.."),
+                      ("file", "AI-Memory/esc/ESCAPED", b"x")],
+            "link_then_file": [("sym", "AI-Memory/up", "."), ("sym", "AI-Memory/f", "up/../../victim.txt"),
+                               ("file", "AI-Memory/f", b"overwritten")],
+            "dup_name": [("file", "AI-Memory/a", b"1"), ("sym", "AI-Memory/a", "b"), ("file", "AI-Memory/a", b"2")],
+            "hardlink_via_symlink": [("sym", "AI-Memory/d", "."), ("lnk", "AI-Memory/h", "AI-Memory/d/../victim.txt")],
+            "hardlink_to_unknown": [("lnk", "AI-Memory/h", "AI-Memory/not-a-member")],
+            "target_through_link": [("sym", "AI-Memory/d", "."), ("sym", "AI-Memory/x", "d/../../victim.txt")],
+        }
+        for with_filter in (True, False):
+            for name, members in attacks.items():
+                with self.subTest(attack=name, data_filter=with_filter):
+                    outside.write_text("original")
+                    t = self._tar(f"{name}.tar.gz", members)
+                    with tarfile.open(t) as tf:
+                        self.assertTrue(backup.unsafe_members(tf), name)
+                    if with_filter:
+                        rep = backup.verify(t)
+                    else:
+                        with self._no_filter():
+                            rep = backup.verify(t)
+                    self.assertEqual(rep["result"], "FAIL")
+                    self.assertEqual(outside.read_text(), "original")
+                    self.assertFalse(list(_isolation.SANDBOX.glob("ESCAPED")))
+        good = self._tar("good-links.tar.gz", [("dir", "AI-Memory", None), ("file", "AI-Memory/registry/projects.json", b"{}"),
+                                               ("sym", "AI-Memory/alias", "registry/projects.json"),
+                                               ("lnk", "AI-Memory/hard", "AI-Memory/registry/projects.json")])
+        with tarfile.open(good) as tf:
+            self.assertEqual(backup.unsafe_members(tf), [])
+        dest = _isolation.SANDBOX / "good-extract"
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir()
+        with self._no_filter(), tarfile.open(good) as tf:
+            backup.safe_extract(tf, dest)
+        self.assertEqual((dest / "AI-Memory/alias").read_text(), "{}")
+        shutil.rmtree(dest)
+
+    def _subroot(self, name):
+        """A second, independent memory root driven through the CLI (restore replaces whole roots)."""
+        root = _isolation.SANDBOX / name
+        shutil.rmtree(root, ignore_errors=True)
+        env = dict(os.environ, AI_MEMORY_ROOT=str(root), PYTHONPATH=str(REPO / "lib"))
+        def cli_(*args, check=True):
+            r = subprocess.run([sys.executable, str(AIMEM), *map(str, args)], capture_output=True, text=True, env=env)
+            if check and r.returncode:
+                raise AssertionError(f"{args}: {r.stdout}{r.stderr}")
+            return r
+        cli_("init", root)
+        cli_("register", "sub", "--name", "Sub")
+        return root, cli_
+
+    def test_project_behind_external_symlink_is_backed_up_and_restored(self):
+        root, cli_ = self._subroot("extroot")
+        ext = _isolation.SANDBOX / "ext-projects" / "sub"
+        shutil.rmtree(ext.parent, ignore_errors=True)
+        ext.parent.mkdir(parents=True)
+        shutil.move(str(root / "projects" / "sub"), str(ext))
+        os.symlink(ext, root / "projects" / "sub")
+        (ext / "CURRENT.md").write_text("# external CURRENT\nprecious-state\n")
+        r = cli_("backup", "--output-dir", _isolation.SANDBOX / "ext-backups", "--verify")
+        self.assertIn("BACKUP_VERIFY=PASS", r.stdout)
+        tarball = r.stdout.split("BACKUP=PASS ", 1)[1].split()[0]
+        shutil.rmtree(root)  # disaster: the live root is gone
+        r = cli_("restore", tarball, "--confirm")
+        self.assertIn("previous_root_moved_to=None", r.stdout)
+        self.assertEqual((root / "projects" / "sub" / "CURRENT.md").read_text(), "# external CURRENT\nprecious-state\n")
+        self.assertFalse((root / "projects" / "sub").is_symlink())
+        self.assertEqual(cli_("doctor", "--deep", "--no-repo").returncode, 0)
+        shutil.rmtree(root)
+        shutil.rmtree(ext.parent)
+        shutil.rmtree(_isolation.SANDBOX / "ext-backups")
+
+    def test_legacy_recursive_backup_format_still_verifies(self):
+        import tarfile
+        from aimem import backup
+        root, cli_ = self._subroot("legacyroot")
+        # exactly how the 4.1.0 engine built backups: recursive tf.add per top-level item + manifest
+        manifest = []
+        for dirpath, _d, files in os.walk(root):
+            for fn in sorted(files):
+                fp = Path(dirpath) / fn
+                rel = fp.relative_to(root)
+                if rel.parts[0] in (".locks", ".run") or fn.startswith("memory.db"):
+                    continue
+                manifest.append(f"{core.sha256_file(fp)}  {rel}")
+        t = _isolation.SANDBOX / "legacy.tar.gz"
+        m = _isolation.SANDBOX / "legacy-manifest"
+        m.write_text("\n".join(manifest) + "\n")
+        with tarfile.open(t, "w:gz") as tf:
+            for item in sorted(root.iterdir()):
+                if item.name in (".locks", ".run"):
+                    continue
+                tf.add(item, arcname=f"AI-Memory/{item.name}",
+                       filter=lambda ti: None if ti.name.split("/")[-1].startswith("memory.db") else ti)
+            tf.add(m, arcname="AI-Memory/BACKUP_MANIFEST.sha256")
+        env = dict(os.environ, AI_MEMORY_ROOT=str(root), PYTHONPATH=str(REPO / "lib"))
+        r = subprocess.run([sys.executable, str(AIMEM), "restore", str(t), "--verify"], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("RESTORE_VERIFY=PASS", r.stdout)
+        shutil.rmtree(root)
+        t.unlink()
+        m.unlink()
+
+
+class TestIsolationGuard(unittest.TestCase):
+    """tests/_isolation.py must never adopt a non-sandbox directory, and must refuse a pre-bound root."""
+
+    def child(self, code, **env):
+        e = dict(os.environ, PYTHONPATH=str(REPO / "lib"))
+        e.update(env)
+        return subprocess.run([sys.executable, "-c", code], cwd=str(REPO / "tests"), capture_output=True, text=True, env=e)
+
+    def test_forged_sandbox_marker_is_ignored(self):
+        fake_home = _isolation.SANDBOX / "fake-home"
+        (fake_home / "AI-Memory").mkdir(parents=True, exist_ok=True)
+        for forged in (str(fake_home), "/", str(Path.home())):
+            r = self.child("import _isolation, tempfile, os\n"
+                           "print(_isolation.SANDBOX)\n"
+                           "print(os.environ['AI_MEMORY_ROOT'])", AIMEM_TEST_ISOLATION_DIR=forged)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            sandbox, root = r.stdout.split()
+            self.assertNotEqual(os.path.realpath(sandbox), os.path.realpath(forged))
+            self.assertTrue(Path(sandbox).name.startswith("aimem-test-sandbox-"))
+            self.assertTrue(root.startswith(sandbox))
+
+    def test_prebound_live_root_aborts_even_with_forged_marker(self):
+        fake_home = _isolation.SANDBOX / "fake-home2"
+        live = fake_home / "AI-Memory"
+        live.mkdir(parents=True, exist_ok=True)
+        (live / "precious.txt").write_text("keep")
+        r = self.child("import aimem.core\nimport _isolation", AI_MEMORY_ROOT=str(live), HOME=str(fake_home),
+                       AIMEM_TEST_ISOLATION_DIR=str(fake_home))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("TEST_ISOLATION_VIOLATION", r.stderr + r.stdout)
+        self.assertEqual((live / "precious.txt").read_text(), "keep")
 
 
 if __name__ == "__main__":

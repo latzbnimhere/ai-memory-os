@@ -46,13 +46,17 @@ def run(cmd, env=None, timeout=900, check=False):
 
 
 class Promotion:
-    def __init__(self, root: Path, live: bool, backup_dir: Path, skip_selftest=False, smoke_slug="ai-memory"):
+    def __init__(self, root: Path, live: bool, backup_dir: Path, skip_selftest=False, smoke_slug="ai-memory", home=None):
         self.root = root
         self.smoke_slug = smoke_slug
+        self.smoke_sid = None  # an OPEN smoke session that rollback must close
         self.live = live
         self.backup_dir = backup_dir
         self.skip_selftest = skip_selftest
         self.env = dict(os.environ, AI_MEMORY_ROOT=str(root))
+        if home is not None:  # rehearsal: never read or write the owner's real HOME (Drive, backups, LaunchAgents)
+            Path(home).mkdir(parents=True, exist_ok=True)
+            self.env["HOME"] = str(home)
         self.report = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "root": str(root), "live": live, "gates": {}, "steps": [], "result": "NOT_RUN"}
         self.preserved = None
 
@@ -75,12 +79,29 @@ class Promotion:
         rc, out = run([sys.executable, str(self.root / "bin" / "aimem"), "sessions", "--open"], env=self.env, timeout=120)
         self.gate(name, rc == 0 and out.strip() == "", f"rc={rc}\n{out}")
 
+    def smoke_slug_gate(self):
+        """Fail before any mutation when the smoke project is not registered on the target root."""
+        try:
+            reg = json.loads((self.root / "registry" / "projects.json").read_text())
+            ok = self.smoke_slug in reg.get("projects", {}) and (self.root / "projects" / self.smoke_slug / "project.json").is_file()
+        except (OSError, ValueError):
+            ok = False
+        self.gate("SMOKE_SLUG_REGISTERED", ok, f"--smoke-slug {self.smoke_slug!r} must be a registered project on {self.root}")
+
+    def migrate_precheck_gate(self):
+        """The NEW engine's read-only migrate dry-run against the untouched target: refuses a root, config or
+        manifest written by a newer engine and pending transactions. Must run before install() overwrites VERSION."""
+        rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "migrate", "--dry-run"], env=self.env)
+        self.gate("NEW_ENGINE_MIGRATE_PRECHECK", rc == 0 and "MIGRATE=DRY_RUN" in out, out)
+
     # ------------------------------------------------------------ gates
     def pre_gates(self):
         self.zero_open_sessions_gate("ZERO_OPEN_SESSIONS_PREFLIGHT")
+        self.smoke_slug_gate()
+        self.migrate_precheck_gate()
         # unit tests get their own empty memory root so no test can ever resolve to the target root
         unit_root = Path(tempfile.mkdtemp(prefix="aimem-promote-unit-root-"))
-        test_env = dict(os.environ, PYTHONPATH=str(DEV / "lib"), AI_MEMORY_ROOT=str(unit_root))
+        test_env = dict(os.environ, PYTHONPATH=str(DEV / "lib"), AI_MEMORY_ROOT=str(unit_root), HOME=str(unit_root))
         rc, out = run(
             [
                 sys.executable,
@@ -103,7 +124,9 @@ class Promotion:
             out,
         )
         if not self.skip_selftest:
-            rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "selftest", "--full"], env=dict(os.environ), timeout=1200)
+            st_home = Path(tempfile.mkdtemp(prefix="aimem-promote-selftest-home-"))
+            rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "selftest", "--full"], env=dict(os.environ, HOME=str(st_home)), timeout=1200)
+            shutil.rmtree(st_home, ignore_errors=True)
             self.gate("FULL_SELFTEST", rc == 0 and "SELFTEST=PASS" in out, out)
         base_bin = self.root / "bin" / "aimem"
         rc, out = run([sys.executable, str(base_bin), "doctor", "--deep"], env=self.env)
@@ -201,10 +224,12 @@ class Promotion:
         rc, out = run([sys.executable, str(v4), "begin", self.smoke_slug, "--agent", "other", "--task", "promotion smoke test", "--tokens", "2000"], env=self.env)
         self.gate("SMOKE_BEGIN", rc == 0 and "SESSION_ID=" in out, out)
         sid = next(l.split("=", 1)[1] for l in out.splitlines() if l.startswith("SESSION_ID="))
+        self.smoke_sid = sid
         rc, out = run([sys.executable, str(step), "--project", self.smoke_slug, "--session", sid, "--kind", "test", "--summary", "promotion smoke step", "--result", "PASS"], env=self.env)
         self.gate("SMOKE_STEP", rc == 0 and "binding=explicit" in out, out)
         rc, out = run([sys.executable, str(v4), "finish", self.smoke_slug, "--session", sid, "--result", "PASS", "--label", "v4-promotion-smoke", "--allow-unchanged", "--no-advance-current"], env=self.env)
         self.gate("SMOKE_FINISH_ADMIN", rc == 0 and "FINISH=PASS" in out, out)
+        self.smoke_sid = None
         rc, out = run([sys.executable, str(v4), "search", self.smoke_slug, "V4"], env=self.env)
         self.gate("SMOKE_SEARCH", rc == 0, out)
         rc, out = run([sys.executable, str(v4), "recover"], env=self.env)
@@ -294,10 +319,21 @@ class Promotion:
                     if Path(b).exists():
                         shutil.copy2(b, path)
                         actions.append(f"restored {path}")
+            session_ok = True
+            if self.smoke_sid:
+                # the smoke session was opened by the new engine; an OPEN session would block every future
+                # promotion (zero-open-sessions gate), so close it administratively with the restored engine
+                rc_s, out_s = run([sys.executable, str(self.root / "bin" / "aimem"), "session", "close", self.smoke_slug,
+                                   "--session", self.smoke_sid, "--result", "ABANDONED", "--note", "promotion rollback"],
+                                  env=self.env)
+                session_ok = rc_s == 0
+                actions.append(f"closed smoke session {self.smoke_sid} rc={rc_s}")
             rc, out = run([sys.executable, str(self.root / "bin" / "aimem"), "doctor", "--deep"], env=self.env)
             actions.append(f"baseline doctor rc={rc}")
-            self.report["rollback"] = {"reason": reason, "actions": actions, "baseline_doctor_rc": rc}
-            print("ROLLBACK_RESULT=" + ("PASS" if rc == 0 else "DOCTOR_FAIL_AFTER_ROLLBACK"))
+            self.report["rollback"] = {"reason": reason, "actions": actions, "baseline_doctor_rc": rc,
+                                       "smoke_session_closed": session_ok}
+            print("ROLLBACK_RESULT=" + ("PASS" if rc == 0 and session_ok else
+                                        "SMOKE_SESSION_LEFT_OPEN" if not session_ok else "DOCTOR_FAIL_AFTER_ROLLBACK"))
         except Exception as e:  # noqa: BLE001
             self.report["rollback"] = {"reason": reason, "actions": actions, "error": str(e)}
             print(f"ROLLBACK_RESULT=ERROR {e}")
@@ -336,12 +372,118 @@ class Promotion:
         return 0 if self.report["result"] == "PASS" else 1
 
 
+def _within(path, base):
+    try:
+        Path(os.path.realpath(path)).relative_to(os.path.realpath(base))
+        return True
+    except ValueError:
+        return False
+
+
+def _isolate_copy(source_root, copy, tmp):
+    """Make the rehearsal copy unable to reach anything live.
+
+    - the optional Drive handoff bridge is disabled in the copy (a smoke finish would otherwise publish
+      the throwaway copy's state to the owner's real handoff folder);
+    - backups of the copy go under tmp, not the owner's backup directory;
+    - symlinks: links resolving inside the live root are re-pointed into the copy; links resolving
+      outside it are replaced by a detached copy of their content (writes through them would otherwise
+      land in live data); dangling links are removed.
+    """
+    stats = {"handoff_bridge_disabled": False, "links_rewritten": 0, "links_dereferenced": 0, "links_removed": 0}
+    hj = copy / "registry" / "handoffs.json"
+    if hj.exists() or (copy / ".handoff").exists():
+        stats["handoff_bridge_disabled"] = True
+        if hj.exists():
+            hj.unlink()
+        shutil.rmtree(copy / ".handoff", ignore_errors=True)
+    cfgp = copy / "config.json"
+    cfg = json.loads(cfgp.read_text()) if cfgp.exists() else {}
+    cfg["backup_dir"] = str(tmp / "backups")
+    cfgp.write_text(json.dumps(cfg, indent=2) + "\n")
+    src_real = os.path.realpath(source_root)
+    for dirpath, dirnames, filenames in os.walk(copy):
+        for name in list(dirnames) + list(filenames):
+            p = os.path.join(dirpath, name)
+            if not os.path.islink(p):
+                continue
+            rel = os.path.relpath(p, copy)
+            real = os.path.realpath(os.path.join(source_root, rel))  # where it points from the live root
+            os.unlink(p)
+            if _within(real, src_real):
+                inside = os.path.join(str(copy), os.path.relpath(real, src_real))
+                os.symlink(os.path.relpath(inside, os.path.dirname(p)), p)
+                stats["links_rewritten"] += 1
+            elif os.path.isdir(real):
+                shutil.copytree(real, p, symlinks=False, ignore_dangling_symlinks=True)
+                stats["links_dereferenced"] += 1
+            elif os.path.isfile(real):
+                shutil.copy2(real, p)
+                stats["links_dereferenced"] += 1
+            else:
+                stats["links_removed"] += 1
+    return stats
+
+
+# Paths the launchd sweep may legitimately touch in the live root during a rehearsal.
+_SWEEP_WRITES = ("AUTO_PHYSICAL_STATE.json",)
+
+
+def _live_manifest(root):
+    """lstat fingerprint of every entry of the live root (no hashing: cheap on large roots)."""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir.split(os.sep)[0] in (".locks", ".run"):
+            dirnames[:] = []
+            continue
+        for name in dirnames + filenames:
+            rel = os.path.normpath(os.path.join(rel_dir, name))
+            if rel.startswith(("registry" + os.sep + "memory.db",)):
+                continue
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            out[rel] = (st.st_size, st.st_mtime_ns, st.st_ino, st.st_mode) if not os.path.isdir(os.path.join(dirpath, name)) \
+                else ("dir", st.st_mode)
+    return out
+
+
+def _live_changes(before, after):
+    changes = []
+    for rel in sorted(set(before) | set(after)):
+        b, a = before.get(rel), after.get(rel)
+        if b == a:
+            continue
+        name = os.path.basename(rel)
+        parts = rel.split(os.sep)
+        if name in _SWEEP_WRITES or "physical-journal" in parts or name == ".DS_Store" \
+                or any(name.startswith(f".{w}.") and name.endswith(".tmp") for w in _SWEEP_WRITES):
+            continue  # launchd sweep writes (incl. its transient atomic-write temp files) and Finder metadata
+        if name == "EVENTS.jsonl" and b and a and a[0] >= b[0]:
+            continue  # append-only growth by the sweep
+        if b and a and b[0] == "dir" and a[0] == "dir":
+            continue  # directory mtime changes are implied by the checks on its entries
+        changes.append(f"{rel}: {'added' if not b else 'removed' if not a else 'modified'}")
+    return changes
+
+
 def rehearse(args, source_root):
     tmp = Path(tempfile.mkdtemp(prefix="aimem-rehearsal-"))
     copy = tmp / "AI-Memory"
     print(f"REHEARSAL_COPY={copy}")
     print(f"REHEARSAL_SOURCE={source_root}")
+    live_before = _live_manifest(source_root)
     shutil.copytree(source_root, copy, ignore=shutil.ignore_patterns(".locks", ".run"), symlinks=True)
+    try:
+        iso = _isolate_copy(source_root, copy, tmp)
+    except (OSError, RecursionError, shutil.Error) as e:
+        print(f"REHEARSAL_REFUSED=could not isolate the copy from live data ({e})")
+        print("MIGRATION_REHEARSAL=FAIL")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return 1
+    print("REHEARSAL_ISOLATION=" + " ".join(f"{k}={v}" for k, v in iso.items()))
     # snapshot canonical hashes for comparison
     def canon(root):
         d = {}
@@ -354,7 +496,8 @@ def rehearse(args, source_root):
                        "events_lines": sum(1 for _ in open(p / "EVENTS.jsonl")) if (p / "EVENTS.jsonl").exists() else 0}
         return d
     before = canon(copy)
-    pr = Promotion(copy, live=False, backup_dir=tmp / "backups", skip_selftest=args.skip_selftest, smoke_slug=args.smoke_slug)
+    pr = Promotion(copy, live=False, backup_dir=tmp / "backups", skip_selftest=args.skip_selftest, smoke_slug=args.smoke_slug,
+                   home=tmp / "home")
     rc = pr.run()
     after = canon(copy)
     cmp = {"canonical_preserved": True, "detail": []}
@@ -373,11 +516,12 @@ def rehearse(args, source_root):
             cmp["canonical_preserved"] = False
             cmp["detail"].append(f"{slug}: EVENTS shrank")
     print(f"REHEARSAL_CANONICAL_PRESERVED={cmp['canonical_preserved']} {cmp['detail'] or ''}")
-    live_before = canon(source_root)
-    # live root must be byte-identical in canonical files to the pre-rehearsal copy (sweep may append EVENTS/AUTO state only)
-    live_ok = all(live_before[s]["CURRENT"] == before[s]["CURRENT"] and live_before[s]["checkpoints"] == before[s]["checkpoints"] for s in before)
-    print(f"LIVE_ROOT_UNTOUCHED_BY_REHEARSAL={live_ok}")
-    rep = {"rehearsal_copy": str(copy), "promotion_result": pr.report["result"], "canonical_comparison": cmp, "live_untouched": live_ok, "gates": pr.report["gates"]}
+    # the live root must be untouched apart from what the launchd sweep may write
+    live_changes = _live_changes(live_before, _live_manifest(source_root))
+    live_ok = not live_changes
+    print(f"LIVE_ROOT_UNTOUCHED_BY_REHEARSAL={live_ok}" + (f" CHANGES={live_changes[:10]}" if live_changes else ""))
+    rep = {"rehearsal_copy": str(copy), "promotion_result": pr.report["result"], "canonical_comparison": cmp,
+           "live_untouched": live_ok, "live_changes": live_changes[:200], "isolation": iso, "gates": pr.report["gates"]}
     (DEV / "reports").mkdir(exist_ok=True)
     (DEV / "reports" / f"MIGRATION_REHEARSAL_{time.strftime('%Y%m%dT%H%M%S%z')}.json").write_text(json.dumps(rep, indent=2))
     ok = rc == 0 and cmp["canonical_preserved"] and live_ok

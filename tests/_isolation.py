@@ -25,15 +25,32 @@ if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
 _ENV_MARKER = "AIMEM_TEST_ISOLATION_DIR"
+_PREFIX = "aimem-test-sandbox-"
+_TMP = Path(tempfile.gettempdir()).resolve()
 
-if os.environ.get(_ENV_MARKER) and Path(os.environ[_ENV_MARKER]).is_dir():
+
+def _genuine_sandbox(value):
+    """Only a directory this module created (tmp/aimem-test-sandbox-*) may be inherited. Anything else
+    (HOME, /, a parent of the live root, a typo) would let tests treat real data as disposable."""
+    try:
+        p = Path(value).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if p.is_dir() and not Path(value).is_symlink() and p.parent == _TMP and p.name.startswith(_PREFIX):
+        return p
+    return None
+
+
+_inherited = _genuine_sandbox(os.environ.get(_ENV_MARKER, ""))
+if _inherited is not None:
     # Child processes spawned by tests inherit the parent's isolated sandbox.
-    SANDBOX = Path(os.environ[_ENV_MARKER])
+    SANDBOX = _inherited
     _owner = False
 else:
-    SANDBOX = Path(tempfile.mkdtemp(prefix="aimem-test-sandbox-")).resolve()
+    SANDBOX = Path(tempfile.mkdtemp(prefix=_PREFIX)).resolve()
     _owner = True
     os.environ[_ENV_MARKER] = str(SANDBOX)
+    atexit.register(shutil.rmtree, SANDBOX, True)  # registered before any guard can abort the run
 
 ROOT = SANDBOX / "memory"
 HOME = SANDBOX / "home"
@@ -51,5 +68,3 @@ else:
     # git must still work without the user's global config
     os.environ.setdefault("GIT_CONFIG_NOSYSTEM", "1")
 
-if _owner:
-    atexit.register(shutil.rmtree, SANDBOX, True)

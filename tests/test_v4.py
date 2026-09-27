@@ -12,6 +12,8 @@ import unittest
 from pathlib import Path
 
 TMP = Path(tempfile.mkdtemp(prefix="aimem-unit-"))
+import atexit  # noqa: E402
+atexit.register(shutil.rmtree, TMP, True)
 ROOT = TMP / "memory"
 os.environ["AI_MEMORY_ROOT"] = str(ROOT)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))

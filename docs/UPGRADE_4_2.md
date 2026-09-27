@@ -45,12 +45,19 @@ Stop at the first failure. Nothing below edits project repositories.
 5. Test the new engine in isolation from the source checkout:
    `python3 -m unittest discover -s tests -v` (no environment needed; it never touches the live root),
    `python3 bin/aimem selftest --full`, `python3 tools/public_audit.py`.
-6. Rehearse against a copy of the live root (the live root is only read):
+6. Rehearse against a copy of the live root (the live root is only read). The copy is isolated before anything runs:
+   the Drive handoff bridge is disabled in the copy, backups and HOME point into the rehearsal temp dir, symlinks into the
+   live root are re-pointed into the copy and symlinks to external data are replaced by a detached copy of that data.
+   `LIVE_ROOT_UNTOUCHED_BY_REHEARSAL` compares a fingerprint of every live file before and after (only sweep writes are
+   tolerated).
    `python3 tools/promote.py --rehearse --root ~/AI-Memory [--smoke-slug <registered-slug>]`
    Required: `MIGRATION_REHEARSAL=PASS`, `REHEARSAL_CANONICAL_PRESERVED=True`, `LIVE_ROOT_UNTOUCHED_BY_REHEARSAL=True`.
    Use `--keep` to inspect the upgraded copy: run `doctor --deep`, `context <slug>`, `search <slug> <term>` against it with
    `AI_MEMORY_ROOT=<copy>`. Expect doctor warnings for orphan checkpoints left by 4.1.0 conflicts; they are not errors.
 7. Promote: `python3 tools/promote.py --live --root ~/AI-Memory --confirm-live-root ~/AI-Memory --backup-dir <dir>`.
+   Before the first mutation it also requires `SMOKE_SLUG_REGISTERED` and `NEW_ENGINE_MIGRATE_PRECHECK` (the new engine's
+   read-only `migrate --dry-run`, which refuses a newer root/config/manifest or pending transactions). If a gate after the
+   smoke `begin` fails, rollback also closes the smoke session so it cannot block the next promotion.
    Note: `--live` also refreshes the managed blocks in `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` (backed up first)
    and restarts the `io.aimemory.sweep` LaunchAgent. Any failed gate after the first mutation rolls back automatically.
 8. Verify on the live root: `aimem version` (4.2.0), `aimem doctor --deep`, `aimem health --verbose`,

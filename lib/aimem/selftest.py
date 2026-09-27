@@ -32,7 +32,10 @@ class T:
         self.repo2 = self.tmp / "repo2"
         self.bk = self.tmp / "backups"
         self.results = []
-        self.env = dict(os.environ, AI_MEMORY_ROOT=str(self.root), AIMEM_SELFTEST="1")
+        # private HOME: selftest children never read the owner's LaunchAgents, ~/.claude, backups or Drive
+        (self.tmp / "home").mkdir(parents=True, exist_ok=True)
+        self.env = dict(os.environ, AI_MEMORY_ROOT=str(self.root), AIMEM_SELFTEST="1", HOME=str(self.tmp / "home"),
+                        GIT_CONFIG_NOSYSTEM="1")
         self.env.pop("AIMEM_SESSION_ID", None)
 
     # ------------------------------------------------------------ helpers
@@ -53,7 +56,7 @@ class T:
         return r.returncode, r.stdout + r.stderr
 
     def git(self, repo, *a):
-        return subprocess.run(["git", "-C", str(repo)] + list(a), capture_output=True, text=True, timeout=30)
+        return subprocess.run(["git", "-C", str(repo)] + list(a), capture_output=True, text=True, timeout=30, env=self.env)
 
     def val(self, out, key):
         for line in out.splitlines():
