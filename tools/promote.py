@@ -469,8 +469,90 @@ def _live_changes(before, after):
     return changes
 
 
+class ProjectLayoutError(ValueError):
+    """The projects/ tree of a root is not what the canonical comparison can trust; rehearsal must fail closed."""
+
+
+def _project_dirs(root):
+    """{slug: manifest} for every project directory under root/projects, failing closed on anything malformed.
+
+    Non-directory entries (Finder's .DS_Store, AppleDouble ._* files, stray notes, symlinks to files, dangling
+    links) are not projects and are skipped; pathlib's "*/" glob only restricts itself to directories on
+    Python >= 3.11, so it cannot be relied on for this. Every directory, however, is a project and must hold a
+    project.json that parses to a JSON object, and every registered slug must be such a directory: a malformed
+    project is never silently dropped from the comparison.
+    """
+    projects = Path(root) / "projects"
+    if not projects.is_dir():
+        raise ProjectLayoutError(f"{projects} is not a directory")
+    found, problems = {}, []
+    for p in sorted(projects.iterdir()):
+        if not p.is_dir():
+            continue
+        pj = p / "project.json"
+        if not pj.is_file():
+            problems.append(f"{p.name}: project directory without a project.json file")
+            continue
+        try:
+            man = json.loads(pj.read_text())
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            problems.append(f"{p.name}: unreadable project.json ({e})")
+            continue
+        if not isinstance(man, dict):
+            problems.append(f"{p.name}: project.json is not a JSON object")
+            continue
+        found[p.name] = man
+    reg_path = Path(root) / "registry" / "projects.json"
+    try:
+        registered = json.loads(reg_path.read_text()).get("projects", {})
+    except (OSError, UnicodeDecodeError, ValueError, AttributeError) as e:
+        problems.append(f"registry/projects.json unreadable ({e})")
+        registered = {}
+    for slug in sorted(registered):
+        if slug not in found and not any(x.startswith(f"{slug}: ") for x in problems):
+            problems.append(f"{slug}: registered but projects/{slug} is not a project directory")
+    if problems:
+        raise ProjectLayoutError("; ".join(problems))
+    return found
+
+
+def _canonical_snapshot(root):
+    """Hashes/counts of each project's canonical state, for the before/after rehearsal comparison."""
+    d = {}
+    for slug, man in _project_dirs(root).items():
+        p = Path(root) / "projects" / slug
+        events = 0
+        if (p / "EVENTS.jsonl").exists():
+            with open(p / "EVENTS.jsonl", "rb") as fh:
+                events = sum(1 for _ in fh)
+        d[slug] = {"CURRENT": sha(p / "CURRENT.md") if (p / "CURRENT.md").exists() else None,
+                   "NEXT": sha(p / "NEXT.md") if (p / "NEXT.md").exists() else None,
+                   "checkpoints": sorted(x.name for x in (p / "checkpoints").glob("*")) if (p / "checkpoints").exists() else [],
+                   "current_checkpoint": man.get("current_checkpoint"),
+                   "events_lines": events}
+    return d
+
+
 def rehearse(args, source_root):
+    # read-only layout check of the source first: refuse before spending a full copy of the root on it
+    try:
+        _project_dirs(source_root)
+    except ProjectLayoutError as e:
+        print(f"REHEARSAL_REFUSED=malformed projects/ layout on the source root ({e})")
+        print("MIGRATION_REHEARSAL=FAIL")
+        return 1
     tmp = Path(tempfile.mkdtemp(prefix="aimem-rehearsal-"))
+    try:
+        return _rehearse_in(args, source_root, tmp)
+    finally:
+        # the copy holds a full duplicate of private memory: never leave it behind, including on an exception
+        if not args.keep:
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            print(f"KEPT={tmp}")
+
+
+def _rehearse_in(args, source_root, tmp):
     copy = tmp / "AI-Memory"
     print(f"REHEARSAL_COPY={copy}")
     print(f"REHEARSAL_SOURCE={source_root}")
@@ -481,26 +563,25 @@ def rehearse(args, source_root):
     except (OSError, RecursionError, shutil.Error) as e:
         print(f"REHEARSAL_REFUSED=could not isolate the copy from live data ({e})")
         print("MIGRATION_REHEARSAL=FAIL")
-        shutil.rmtree(tmp, ignore_errors=True)
         return 1
     print("REHEARSAL_ISOLATION=" + " ".join(f"{k}={v}" for k, v in iso.items()))
     # snapshot canonical hashes for comparison
-    def canon(root):
-        d = {}
-        for p in sorted((root / "projects").glob("*/")):
-            slug = p.name
-            d[slug] = {"CURRENT": sha(p / "CURRENT.md") if (p / "CURRENT.md").exists() else None,
-                       "NEXT": sha(p / "NEXT.md") if (p / "NEXT.md").exists() else None,
-                       "checkpoints": sorted(x.name for x in (p / "checkpoints").glob("*")) if (p / "checkpoints").exists() else [],
-                       "current_checkpoint": json.loads((p / "project.json").read_text()).get("current_checkpoint"),
-                       "events_lines": sum(1 for _ in open(p / "EVENTS.jsonl")) if (p / "EVENTS.jsonl").exists() else 0}
-        return d
-    before = canon(copy)
+    try:
+        before = _canonical_snapshot(copy)
+    except ProjectLayoutError as e:
+        print(f"REHEARSAL_REFUSED=malformed projects/ layout in the rehearsal copy ({e})")
+        print("MIGRATION_REHEARSAL=FAIL")
+        return 1
     pr = Promotion(copy, live=False, backup_dir=tmp / "backups", skip_selftest=args.skip_selftest, smoke_slug=args.smoke_slug,
                    home=tmp / "home")
     rc = pr.run()
-    after = canon(copy)
     cmp = {"canonical_preserved": True, "detail": []}
+    try:
+        after = _canonical_snapshot(copy)
+    except ProjectLayoutError as e:
+        after = {}
+        cmp["canonical_preserved"] = False
+        cmp["detail"].append(f"projects/ layout broken after promotion: {e}")
     for slug in before:
         b, a = before[slug], after.get(slug, {})
         if b["CURRENT"] != a.get("CURRENT") or b["NEXT"] != a.get("NEXT"):
@@ -526,10 +607,6 @@ def rehearse(args, source_root):
     (DEV / "reports" / f"MIGRATION_REHEARSAL_{time.strftime('%Y%m%dT%H%M%S%z')}.json").write_text(json.dumps(rep, indent=2))
     ok = rc == 0 and cmp["canonical_preserved"] and live_ok
     print(f"MIGRATION_REHEARSAL={'PASS' if ok else 'FAIL'}")
-    if not args.keep:
-        shutil.rmtree(tmp, ignore_errors=True)
-    else:
-        print(f"KEPT={tmp}")
     return 0 if ok else 1
 
 
