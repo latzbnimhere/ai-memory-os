@@ -59,7 +59,9 @@ Stop at the first failure. Nothing below edits project repositories.
    read-only `migrate --dry-run`, which refuses a newer root/config/manifest or pending transactions). If a gate after the
    smoke `begin` fails, rollback also closes the smoke session so it cannot block the next promotion.
    Note: `--live` also refreshes the managed blocks in `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` (backed up first)
-   and restarts the `io.aimemory.sweep` LaunchAgent. Any failed gate after the first mutation rolls back automatically.
+   and restarts the sweep LaunchAgent: the one whose program is `<root>/bin/aimem-sweep`, whatever its label
+   (`io.aimemory.sweep` for new installs; older installations keep their own). Any failed gate after the first
+   mutation rolls back automatically.
 8. Verify on the live root: `aimem version` (4.2.0), `aimem doctor --deep`, `aimem health --verbose`,
    `aimem-detect` in each registered repo, `aimem context <slug>` for each project (NEXT present, budget respected),
    `aimem search <slug> <known term>`, compare CURRENT/NEXT hashes, checkpoint lists and journal line counts with step 1.

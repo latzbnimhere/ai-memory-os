@@ -9,11 +9,10 @@ import sqlite3
 import time
 from pathlib import Path
 
-from . import core, index, objects, provenance, recover, sessions, txn
+from . import core, index, launchagent, objects, provenance, recover, sessions, txn
 from .core import CONFIG, DB, ROOT, config, project_dir, registry, try_load_json
 
 REQUIRED = ["project.json", "CURRENT.md", "NEXT.md", "DECISIONS.jsonl", "EVENTS.jsonl", "ARTIFACTS.jsonl"]
-LAUNCH_AGENT = Path.home() / "Library" / "LaunchAgents" / "io.aimemory.sweep.plist"
 
 
 def _jsonl_valid(path):
@@ -275,10 +274,11 @@ def run(deep=False, check_repo=True, repair=False, slug_filter=None):
                       "quarantines and rebuilds it from canonical files)")
     elif dbh.startswith(index.DB_UNAVAILABLE_PREFIX):
         warnings.append(f"memory.db {dbh[:200]} (busy/locked; not treated as damage; re-run doctor)")
-    # LaunchAgent
-    if LAUNCH_AGENT.exists():
+    # LaunchAgent (found by the aimem-sweep it runs: older installations use their own label)
+    _, la_plist = launchagent.find(ROOT)
+    if la_plist.exists():
         try:
-            pl = plistlib.loads(LAUNCH_AGENT.read_bytes())
+            pl = plistlib.loads(la_plist.read_bytes())
             args = pl.get("ProgramArguments", [])
             if not any(str(a).endswith("aimem-sweep") for a in args):
                 warnings.append("LaunchAgent does not run aimem-sweep")

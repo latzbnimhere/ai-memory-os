@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from . import backup, core, doctor, index, provenance, recover, reconcile, sessions, txn
+from . import backup, core, doctor, index, launchagent, provenance, recover, reconcile, sessions, txn
 from .core import ROOT, config, project_dir, registry
 
 
@@ -61,13 +61,13 @@ def collect(slug_filter=None, check_repo=True):
     h["doctor_warnings"] = len(warnings)
     h["journal_health"] = "OK" if not any("invalid JSONL" in e for e in errors) else "INVALID_JSONL"
     h["checkpoint_integrity"] = "OK" if not any("checkpoint" in e for e in errors) else "FAIL"
-    la = doctor.LAUNCH_AGENT
+    la_label, la = launchagent.find(ROOT)
     h["launchagent"] = "INSTALLED" if la.exists() else "NOT_INSTALLED"
     if la.exists():
         import subprocess
         try:
             r = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=10)
-            h["launchagent"] = "LOADED" if "io.aimemory.sweep" in r.stdout else "INSTALLED_NOT_LOADED"
+            h["launchagent"] = "LOADED" if launchagent.is_loaded(la_label, r.stdout) else "INSTALLED_NOT_LOADED"
         except Exception:
             pass
     nb = backup.newest()

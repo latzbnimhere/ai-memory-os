@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -37,6 +38,15 @@ def sha(p):
         for c in iter(lambda: f.read(1 << 20), b""):
             h.update(c)
     return h.hexdigest()
+
+
+def _launchagent_module():
+    """The NEW engine's lib/aimem/launchagent.py, loaded by path: importing the aimem package would bind
+    AI_MEMORY_ROOT at import time."""
+    spec = importlib.util.spec_from_file_location("aimem_launchagent", DEV / "lib" / "aimem" / "launchagent.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def run(cmd, env=None, timeout=900, check=False):
@@ -242,14 +252,18 @@ class Promotion:
         rc, out = run([sys.executable, str(v4), "integrate-global", "--agent", "all"], env=self.env)
         self.gate("GLOBAL_INSTRUCTIONS", rc == 0 and out.count("verified=True") == 2, out)
         self.report["integration"] = out
-        # LaunchAgent: same plist path/args; restart so it runs the V4 launcher
+        # LaunchAgent: same plist path/args; restart so it runs the V4 launcher. It is found by the aimem-sweep it
+        # runs, not by name: installations older than the open-source release use their own label.
+        la = _launchagent_module()
+        label, plist = la.find(self.root)
+        self.report["launchagent"] = {"label": label, "plist": str(plist)}
         uid = os.getuid()
-        rc, out = run(["launchctl", "kickstart", "-k", f"gui/{uid}/io.aimemory.sweep"])
+        rc, out = run(["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"])
         time.sleep(3)
         rc2, out2 = run([sys.executable, str(self.root / "bin" / "aimem-sweep")], env=self.env)
-        self.gate("LAUNCHAGENT_SWEEP_RUNS_V4", rc2 == 0 and "SWEEP=PASS" in out2, out + out2)
+        self.gate("LAUNCHAGENT_SWEEP_RUNS_V4", rc2 == 0 and "SWEEP=PASS" in out2, f"kickstart {label} rc={rc}\n" + out + out2)
         rc, out = run(["launchctl", "list"])
-        self.gate("LAUNCHAGENT_LOADED", "io.aimemory.sweep" in out, out[-500:])
+        self.gate("LAUNCHAGENT_LOADED", la.is_loaded(label, out), f"label={label} plist={plist}\n" + out[-500:])
 
     # ------------------------------------------------------------ rollback
     def rollback(self, reason):
