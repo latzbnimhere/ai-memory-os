@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -469,6 +470,80 @@ def _live_changes(before, after):
     return changes
 
 
+# Runtime logs the launchd sweep appends to while a rehearsal runs (its StandardOutPath, opened O_APPEND each run).
+# Such a log may only grow by appending: the same regular file (device, inode, mode) with every pre-rehearsal byte
+# intact as its prefix. It is judged by content instead of the lstat manifest; every other path stays strict.
+_APPEND_ONLY_LOGS = (os.path.join("logs", "aimem-sweep.out.log"),)
+
+
+def _append_only_snapshot(root):
+    """{rel: identity + prefix hash} of each append-only log present as a regular file (absent or not a regular
+    file: no tolerance, the manifest comparison applies unchanged)."""
+    snap = {}
+    for rel in _APPEND_ONLY_LOGS:
+        try:
+            fd = os.open(os.path.join(root, rel), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            data = fh.read(st.st_size)
+        snap[rel] = {"dev": st.st_dev, "ino": st.st_ino, "mode": st.st_mode, "size": len(data),
+                     "sha256": hashlib.sha256(data).hexdigest()}
+    return snap
+
+
+def _append_only_verdict(root, rel, before):
+    """(ok, detail) for one append-only log against its pre-rehearsal snapshot."""
+    try:
+        fd = os.open(os.path.join(root, rel), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False, "removed"
+    except OSError as e:
+        return False, f"replaced or unreadable ({e.strerror})"
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (before["dev"], before["ino"]):
+            return False, "replaced (not the same file)"
+        if st.st_mode != before["mode"]:
+            return False, "mode changed"
+        if st.st_size < before["size"]:
+            return False, f"truncated ({before['size']} -> {st.st_size} bytes)"
+        prefix = fh.read(before["size"])
+    if len(prefix) != before["size"] or hashlib.sha256(prefix).hexdigest() != before["sha256"]:
+        return False, "existing bytes modified"
+    grown = st.st_size - before["size"]
+    return True, f"appended {grown} bytes" if grown else "unchanged"
+
+
+def _live_root_changes(root, manifest_before, logs_before):
+    """(unexpected changes, expected concurrent writes) of the live root since the pre-rehearsal snapshots."""
+    changes = _live_changes({k: v for k, v in manifest_before.items() if k not in logs_before},
+                            {k: v for k, v in _live_manifest(root).items() if k not in logs_before})
+    expected = []
+    for rel, b in sorted(logs_before.items()):
+        ok, detail = _append_only_verdict(root, rel, b)
+        (expected if ok else changes).append(f"{rel}: {detail}")
+    return sorted(changes), expected
+
+
+def _remove_tree(path):
+    """Remove a rehearsal temp tree, including sealed (read-only) directories copied from the root: rmtree cannot
+    unlink the entries of a directory without owner write permission. Never follows symlinks. True when gone."""
+    for dirpath, dirnames, _ in os.walk(path):
+        for d in [dirpath] + [os.path.join(dirpath, n) for n in dirnames]:
+            try:
+                st = os.lstat(d)
+                if stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_IRWXU != stat.S_IRWXU:
+                    os.chmod(d, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+    return not os.path.lexists(path)
+
+
 class ProjectLayoutError(ValueError):
     """The projects/ tree of a root is not what the canonical comparison can trust; rehearsal must fail closed."""
 
@@ -542,14 +617,19 @@ def rehearse(args, source_root):
         print("MIGRATION_REHEARSAL=FAIL")
         return 1
     tmp = Path(tempfile.mkdtemp(prefix="aimem-rehearsal-"))
+    ok = False
     try:
-        return _rehearse_in(args, source_root, tmp)
+        ok = _rehearse_in(args, source_root, tmp)
     finally:
         # the copy holds a full duplicate of private memory: never leave it behind, including on an exception
-        if not args.keep:
-            shutil.rmtree(tmp, ignore_errors=True)
-        else:
+        if args.keep:
             print(f"KEPT={tmp}")
+        else:
+            cleaned = _remove_tree(tmp)
+            print(f"REHEARSAL_TEMP_CLEANUP={'PASS' if cleaned else 'FAIL'} {tmp}")
+            ok = ok and cleaned
+    print(f"MIGRATION_REHEARSAL={'PASS' if ok else 'FAIL'}")
+    return 0 if ok else 1
 
 
 def _rehearse_in(args, source_root, tmp):
@@ -557,21 +637,20 @@ def _rehearse_in(args, source_root, tmp):
     print(f"REHEARSAL_COPY={copy}")
     print(f"REHEARSAL_SOURCE={source_root}")
     live_before = _live_manifest(source_root)
+    logs_before = _append_only_snapshot(source_root)
     shutil.copytree(source_root, copy, ignore=shutil.ignore_patterns(".locks", ".run"), symlinks=True)
     try:
         iso = _isolate_copy(source_root, copy, tmp)
     except (OSError, RecursionError, shutil.Error) as e:
         print(f"REHEARSAL_REFUSED=could not isolate the copy from live data ({e})")
-        print("MIGRATION_REHEARSAL=FAIL")
-        return 1
+        return False
     print("REHEARSAL_ISOLATION=" + " ".join(f"{k}={v}" for k, v in iso.items()))
     # snapshot canonical hashes for comparison
     try:
         before = _canonical_snapshot(copy)
     except ProjectLayoutError as e:
         print(f"REHEARSAL_REFUSED=malformed projects/ layout in the rehearsal copy ({e})")
-        print("MIGRATION_REHEARSAL=FAIL")
-        return 1
+        return False
     pr = Promotion(copy, live=False, backup_dir=tmp / "backups", skip_selftest=args.skip_selftest, smoke_slug=args.smoke_slug,
                    home=tmp / "home")
     rc = pr.run()
@@ -598,16 +677,16 @@ def _rehearse_in(args, source_root, tmp):
             cmp["detail"].append(f"{slug}: EVENTS shrank")
     print(f"REHEARSAL_CANONICAL_PRESERVED={cmp['canonical_preserved']} {cmp['detail'] or ''}")
     # the live root must be untouched apart from what the launchd sweep may write
-    live_changes = _live_changes(live_before, _live_manifest(source_root))
+    live_changes, live_expected = _live_root_changes(source_root, live_before, logs_before)
     live_ok = not live_changes
+    print(f"LIVE_ROOT_EXPECTED_CONCURRENT_WRITES={live_expected}")
     print(f"LIVE_ROOT_UNTOUCHED_BY_REHEARSAL={live_ok}" + (f" CHANGES={live_changes[:10]}" if live_changes else ""))
     rep = {"rehearsal_copy": str(copy), "promotion_result": pr.report["result"], "canonical_comparison": cmp,
-           "live_untouched": live_ok, "live_changes": live_changes[:200], "isolation": iso, "gates": pr.report["gates"]}
+           "live_untouched": live_ok, "live_changes": live_changes[:200], "live_expected_concurrent_writes": live_expected,
+           "isolation": iso, "gates": pr.report["gates"]}
     (DEV / "reports").mkdir(exist_ok=True)
     (DEV / "reports" / f"MIGRATION_REHEARSAL_{time.strftime('%Y%m%dT%H%M%S%z')}.json").write_text(json.dumps(rep, indent=2))
-    ok = rc == 0 and cmp["canonical_preserved"] and live_ok
-    print(f"MIGRATION_REHEARSAL={'PASS' if ok else 'FAIL'}")
-    return 0 if ok else 1
+    return rc == 0 and cmp["canonical_preserved"] and live_ok
 
 
 def _resolve_root(value):
