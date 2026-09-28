@@ -24,7 +24,9 @@ Then:
 
     python3 bin/aimem selftest --full
 
-Development and CI should use a temporary AI_MEMORY_ROOT.
+Every test module that imports `aimem` in-process must `import _isolation` first (see `tests/_isolation.py`): it forces a
+throwaway AI_MEMORY_ROOT and HOME before `aimem.core` binds its paths and aborts the run otherwise. When you fix a bug,
+add a regression test that fails on the old code (see `tests/test_hardening.py`).
 
 ## Pull requests
 

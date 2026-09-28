@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Controlled promotion to AI Memory OS 4.1.0 with rehearsal, gates, verification and automatic rollback.
+"""Controlled promotion to the AI Memory OS version in ./VERSION with rehearsal, gates, verification and automatic rollback.
 
   python3 tools/promote.py --rehearse --root /path/to/AI-Memory
   python3 tools/promote.py --live --root /path/to/AI-Memory --confirm-live-root /path/to/AI-Memory --backup-dir D
@@ -7,16 +7,18 @@
 Gates (all must pass before any live mutation): zero OPEN sessions on the target root (checked at preflight, before
 the backup and again immediately before the first mutation), unit tests on an isolated root, full isolated selftest,
 baseline doctor --deep on the target root, fresh verified backup of the target root. After install: migrate,
-doctor --deep, health, hash verification, functional smoke (begin/step/finish on the ai-memory slug). Any failure after
-the first mutation -> rollback to the preserved pre-4.1.0 files; a failure before it leaves the root untouched.
+doctor --deep, health, hash verification, functional smoke (begin/step/finish on --smoke-slug, default ai-memory). Any failure after
+the first mutation -> rollback to the preserved pre-promotion files; a failure before it leaves the root untouched.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,6 +26,7 @@ import time
 from pathlib import Path
 
 DEV = Path(__file__).resolve().parents[1]
+DEV_VERSION = (DEV / "VERSION").read_text().strip()
 BIN_FILES = ["aimem", "aimem-detect", "aimem-step", "aimem-sweep"]
 SHARE_FILES = ["AI_MEMORY_AGENT_PROTOCOL_V4.md", "AI_MEMORY_AUTOPILOT.md", "AI_MEMORY_CONTINUOUS_JOURNAL.md",
                "OTHER_AI_AGENT_INSTRUCTIONS.md", "SESSION_BINDING_V3_1.md", "AI_PROTOCOL.md"]
@@ -37,6 +40,15 @@ def sha(p):
     return h.hexdigest()
 
 
+def _launchagent_module():
+    """The NEW engine's lib/aimem/launchagent.py, loaded by path: importing the aimem package would bind
+    AI_MEMORY_ROOT at import time."""
+    spec = importlib.util.spec_from_file_location("aimem_launchagent", DEV / "lib" / "aimem" / "launchagent.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def run(cmd, env=None, timeout=900, check=False):
     r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
     if check and r.returncode != 0:
@@ -45,12 +57,17 @@ def run(cmd, env=None, timeout=900, check=False):
 
 
 class Promotion:
-    def __init__(self, root: Path, live: bool, backup_dir: Path, skip_selftest=False):
+    def __init__(self, root: Path, live: bool, backup_dir: Path, skip_selftest=False, smoke_slug="ai-memory", home=None):
         self.root = root
+        self.smoke_slug = smoke_slug
+        self.smoke_sid = None  # an OPEN smoke session that rollback must close
         self.live = live
         self.backup_dir = backup_dir
         self.skip_selftest = skip_selftest
         self.env = dict(os.environ, AI_MEMORY_ROOT=str(root))
+        if home is not None:  # rehearsal: never read or write the owner's real HOME (Drive, backups, LaunchAgents)
+            Path(home).mkdir(parents=True, exist_ok=True)
+            self.env["HOME"] = str(home)
         self.report = {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "root": str(root), "live": live, "gates": {}, "steps": [], "result": "NOT_RUN"}
         self.preserved = None
 
@@ -73,12 +90,29 @@ class Promotion:
         rc, out = run([sys.executable, str(self.root / "bin" / "aimem"), "sessions", "--open"], env=self.env, timeout=120)
         self.gate(name, rc == 0 and out.strip() == "", f"rc={rc}\n{out}")
 
+    def smoke_slug_gate(self):
+        """Fail before any mutation when the smoke project is not registered on the target root."""
+        try:
+            reg = json.loads((self.root / "registry" / "projects.json").read_text())
+            ok = self.smoke_slug in reg.get("projects", {}) and (self.root / "projects" / self.smoke_slug / "project.json").is_file()
+        except (OSError, ValueError):
+            ok = False
+        self.gate("SMOKE_SLUG_REGISTERED", ok, f"--smoke-slug {self.smoke_slug!r} must be a registered project on {self.root}")
+
+    def migrate_precheck_gate(self):
+        """The NEW engine's read-only migrate dry-run against the untouched target: refuses a root, config or
+        manifest written by a newer engine and pending transactions. Must run before install() overwrites VERSION."""
+        rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "migrate", "--dry-run"], env=self.env)
+        self.gate("NEW_ENGINE_MIGRATE_PRECHECK", rc == 0 and "MIGRATE=DRY_RUN" in out, out)
+
     # ------------------------------------------------------------ gates
     def pre_gates(self):
         self.zero_open_sessions_gate("ZERO_OPEN_SESSIONS_PREFLIGHT")
+        self.smoke_slug_gate()
+        self.migrate_precheck_gate()
         # unit tests get their own empty memory root so no test can ever resolve to the target root
         unit_root = Path(tempfile.mkdtemp(prefix="aimem-promote-unit-root-"))
-        test_env = dict(os.environ, PYTHONPATH=str(DEV / "lib"), AI_MEMORY_ROOT=str(unit_root))
+        test_env = dict(os.environ, PYTHONPATH=str(DEV / "lib"), AI_MEMORY_ROOT=str(unit_root), HOME=str(unit_root))
         rc, out = run(
             [
                 sys.executable,
@@ -101,7 +135,9 @@ class Promotion:
             out,
         )
         if not self.skip_selftest:
-            rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "selftest", "--full"], env=dict(os.environ), timeout=1200)
+            st_home = Path(tempfile.mkdtemp(prefix="aimem-promote-selftest-home-"))
+            rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "selftest", "--full"], env=dict(os.environ, HOME=str(st_home)), timeout=1200)
+            shutil.rmtree(st_home, ignore_errors=True)
             self.gate("FULL_SELFTEST", rc == 0 and "SELFTEST=PASS" in out, out)
         base_bin = self.root / "bin" / "aimem"
         rc, out = run([sys.executable, str(base_bin), "doctor", "--deep"], env=self.env)
@@ -110,14 +146,14 @@ class Promotion:
         self.report["baseline_version"] = out.strip().splitlines()[0] if out else "?"
         self.zero_open_sessions_gate("ZERO_OPEN_SESSIONS_BEFORE_BACKUP")
         # fresh verified backup with the V4 backup module (manifest + isolated restore verify)
-        rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "backup", "--output-dir", str(self.backup_dir), "--label", "pre-4.1.0-promotion", "--verify"], env=self.env)
+        rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "backup", "--output-dir", str(self.backup_dir), "--label", f"pre-{DEV_VERSION}-promotion", "--verify"], env=self.env)
         self.gate("PRE_PROMOTION_BACKUP_VERIFIED", rc == 0 and "BACKUP_VERIFY=PASS" in out, out)
         self.report["pre_promotion_backup"] = next((l.split()[-1] for l in out.splitlines() if l.startswith("BACKUP=PASS")), None)
 
     # ------------------------------------------------------------ install
     def preserve(self):
         stamp = time.strftime("%Y%m%dT%H%M%S%z")
-        keep = self.root / ".previous" / f"pre-4.1.0-{stamp}"
+        keep = self.root / ".previous" / f"pre-{DEV_VERSION}-{stamp}"
         (keep / "bin").mkdir(parents=True)
         for f in BIN_FILES:
             src = self.root / "bin" / f
@@ -144,7 +180,7 @@ class Promotion:
             )
 
         self.preserved = keep
-        self.step("PRESERVE_PRE_4_1_0_FILES", str(keep))
+        self.step("PRESERVE_PRE_PROMOTION_FILES", str(keep))
 
     def install(self):
         for f in BIN_FILES:
@@ -163,7 +199,7 @@ class Promotion:
             shutil.rmtree(docs_dst)
         shutil.copytree(DEV / "docs", docs_dst)
         shutil.copy2(DEV / "README.md", self.root / "docs" / "v4" / "README.md")
-        (self.root / "VERSION").write_text("4.1.0\n")
+        (self.root / "VERSION").write_text(DEV_VERSION + "\n")
         self.step("INSTALL_BIN_LIB_DOCS")
         # hash verification
         mism = []
@@ -178,7 +214,7 @@ class Promotion:
     def migrate_and_verify(self):
         v4 = self.root / "bin" / "aimem"
         rc, out = run([sys.executable, str(v4), "version"], env=self.env)
-        self.gate("V4_EXECUTABLE_RUNS", rc == 0 and "aimem 4.1." in out, out)
+        self.gate("V4_EXECUTABLE_RUNS", rc == 0 and f"aimem {DEV_VERSION}" in out, out)
         rc, out = run([sys.executable, str(v4), "migrate", "--dry-run"], env=self.env)
         self.step("MIGRATE_DRY_RUN", out)
         rc, out = run([sys.executable, str(v4), "migrate"], env=self.env)
@@ -196,14 +232,16 @@ class Promotion:
     def smoke(self):
         v4 = self.root / "bin" / "aimem"
         step = self.root / "bin" / "aimem-step"
-        rc, out = run([sys.executable, str(v4), "begin", "ai-memory", "--agent", "other", "--task", "promotion smoke test", "--tokens", "2000"], env=self.env)
+        rc, out = run([sys.executable, str(v4), "begin", self.smoke_slug, "--agent", "other", "--task", "promotion smoke test", "--tokens", "2000"], env=self.env)
         self.gate("SMOKE_BEGIN", rc == 0 and "SESSION_ID=" in out, out)
         sid = next(l.split("=", 1)[1] for l in out.splitlines() if l.startswith("SESSION_ID="))
-        rc, out = run([sys.executable, str(step), "--project", "ai-memory", "--session", sid, "--kind", "test", "--summary", "promotion smoke step", "--result", "PASS"], env=self.env)
+        self.smoke_sid = sid
+        rc, out = run([sys.executable, str(step), "--project", self.smoke_slug, "--session", sid, "--kind", "test", "--summary", "promotion smoke step", "--result", "PASS"], env=self.env)
         self.gate("SMOKE_STEP", rc == 0 and "binding=explicit" in out, out)
-        rc, out = run([sys.executable, str(v4), "finish", "ai-memory", "--session", sid, "--result", "PASS", "--label", "v4-promotion-smoke", "--allow-unchanged", "--no-advance-current"], env=self.env)
+        rc, out = run([sys.executable, str(v4), "finish", self.smoke_slug, "--session", sid, "--result", "PASS", "--label", "v4-promotion-smoke", "--allow-unchanged", "--no-advance-current"], env=self.env)
         self.gate("SMOKE_FINISH_ADMIN", rc == 0 and "FINISH=PASS" in out, out)
-        rc, out = run([sys.executable, str(v4), "search", "ai-memory", "V4"], env=self.env)
+        self.smoke_sid = None
+        rc, out = run([sys.executable, str(v4), "search", self.smoke_slug, "V4"], env=self.env)
         self.gate("SMOKE_SEARCH", rc == 0, out)
         rc, out = run([sys.executable, str(v4), "recover"], env=self.env)
         self.report["recover_scan"] = out[-2000:]
@@ -214,14 +252,18 @@ class Promotion:
         rc, out = run([sys.executable, str(v4), "integrate-global", "--agent", "all"], env=self.env)
         self.gate("GLOBAL_INSTRUCTIONS", rc == 0 and out.count("verified=True") == 2, out)
         self.report["integration"] = out
-        # LaunchAgent: same plist path/args; restart so it runs the V4 launcher
+        # LaunchAgent: same plist path/args; restart so it runs the V4 launcher. It is found by the aimem-sweep it
+        # runs, not by name: installations older than the open-source release use their own label.
+        la = _launchagent_module()
+        label, plist = la.find(self.root)
+        self.report["launchagent"] = {"label": label, "plist": str(plist)}
         uid = os.getuid()
-        rc, out = run(["launchctl", "kickstart", "-k", f"gui/{uid}/io.aimemory.sweep"])
+        rc, out = run(["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"])
         time.sleep(3)
         rc2, out2 = run([sys.executable, str(self.root / "bin" / "aimem-sweep")], env=self.env)
-        self.gate("LAUNCHAGENT_SWEEP_RUNS_V4", rc2 == 0 and "SWEEP=PASS" in out2, out + out2)
+        self.gate("LAUNCHAGENT_SWEEP_RUNS_V4", rc2 == 0 and "SWEEP=PASS" in out2, f"kickstart {label} rc={rc}\n" + out + out2)
         rc, out = run(["launchctl", "list"])
-        self.gate("LAUNCHAGENT_LOADED", "io.aimemory.sweep" in out, out[-500:])
+        self.gate("LAUNCHAGENT_LOADED", la.is_loaded(label, out), f"label={label} plist={plist}\n" + out[-500:])
 
     # ------------------------------------------------------------ rollback
     def rollback(self, reason):
@@ -292,10 +334,21 @@ class Promotion:
                     if Path(b).exists():
                         shutil.copy2(b, path)
                         actions.append(f"restored {path}")
+            session_ok = True
+            if self.smoke_sid:
+                # the smoke session was opened by the new engine; an OPEN session would block every future
+                # promotion (zero-open-sessions gate), so close it administratively with the restored engine
+                rc_s, out_s = run([sys.executable, str(self.root / "bin" / "aimem"), "session", "close", self.smoke_slug,
+                                   "--session", self.smoke_sid, "--result", "ABANDONED", "--note", "promotion rollback"],
+                                  env=self.env)
+                session_ok = rc_s == 0
+                actions.append(f"closed smoke session {self.smoke_sid} rc={rc_s}")
             rc, out = run([sys.executable, str(self.root / "bin" / "aimem"), "doctor", "--deep"], env=self.env)
             actions.append(f"baseline doctor rc={rc}")
-            self.report["rollback"] = {"reason": reason, "actions": actions, "baseline_doctor_rc": rc}
-            print("ROLLBACK_RESULT=" + ("PASS" if rc == 0 else "DOCTOR_FAIL_AFTER_ROLLBACK"))
+            self.report["rollback"] = {"reason": reason, "actions": actions, "baseline_doctor_rc": rc,
+                                       "smoke_session_closed": session_ok}
+            print("ROLLBACK_RESULT=" + ("PASS" if rc == 0 and session_ok else
+                                        "SMOKE_SESSION_LEFT_OPEN" if not session_ok else "DOCTOR_FAIL_AFTER_ROLLBACK"))
         except Exception as e:  # noqa: BLE001
             self.report["rollback"] = {"reason": reason, "actions": actions, "error": str(e)}
             print(f"ROLLBACK_RESULT=ERROR {e}")
@@ -334,34 +387,300 @@ class Promotion:
         return 0 if self.report["result"] == "PASS" else 1
 
 
+def _within(path, base):
+    try:
+        Path(os.path.realpath(path)).relative_to(os.path.realpath(base))
+        return True
+    except ValueError:
+        return False
+
+
+def _isolate_copy(source_root, copy, tmp):
+    """Make the rehearsal copy unable to reach anything live.
+
+    - the optional Drive handoff bridge is disabled in the copy (a smoke finish would otherwise publish
+      the throwaway copy's state to the owner's real handoff folder);
+    - backups of the copy go under tmp, not the owner's backup directory;
+    - symlinks: links resolving inside the live root are re-pointed into the copy; links resolving
+      outside it are replaced by a detached copy of their content (writes through them would otherwise
+      land in live data); dangling links are removed.
+    """
+    stats = {"handoff_bridge_disabled": False, "links_rewritten": 0, "links_dereferenced": 0, "links_removed": 0}
+    hj = copy / "registry" / "handoffs.json"
+    if hj.exists() or (copy / ".handoff").exists():
+        stats["handoff_bridge_disabled"] = True
+        if hj.exists():
+            hj.unlink()
+        shutil.rmtree(copy / ".handoff", ignore_errors=True)
+    cfgp = copy / "config.json"
+    cfg = json.loads(cfgp.read_text()) if cfgp.exists() else {}
+    cfg["backup_dir"] = str(tmp / "backups")
+    cfgp.write_text(json.dumps(cfg, indent=2) + "\n")
+    src_real = os.path.realpath(source_root)
+    for dirpath, dirnames, filenames in os.walk(copy):
+        for name in list(dirnames) + list(filenames):
+            p = os.path.join(dirpath, name)
+            if not os.path.islink(p):
+                continue
+            rel = os.path.relpath(p, copy)
+            real = os.path.realpath(os.path.join(source_root, rel))  # where it points from the live root
+            os.unlink(p)
+            if _within(real, src_real):
+                inside = os.path.join(str(copy), os.path.relpath(real, src_real))
+                os.symlink(os.path.relpath(inside, os.path.dirname(p)), p)
+                stats["links_rewritten"] += 1
+            elif os.path.isdir(real):
+                shutil.copytree(real, p, symlinks=False, ignore_dangling_symlinks=True)
+                stats["links_dereferenced"] += 1
+            elif os.path.isfile(real):
+                shutil.copy2(real, p)
+                stats["links_dereferenced"] += 1
+            else:
+                stats["links_removed"] += 1
+    return stats
+
+
+# Paths the launchd sweep may legitimately touch in the live root during a rehearsal.
+_SWEEP_WRITES = ("AUTO_PHYSICAL_STATE.json",)
+
+
+def _live_manifest(root):
+    """lstat fingerprint of every entry of the live root (no hashing: cheap on large roots)."""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir.split(os.sep)[0] in (".locks", ".run"):
+            dirnames[:] = []
+            continue
+        for name in dirnames + filenames:
+            rel = os.path.normpath(os.path.join(rel_dir, name))
+            if rel.startswith(("registry" + os.sep + "memory.db",)):
+                continue
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            out[rel] = (st.st_size, st.st_mtime_ns, st.st_ino, st.st_mode) if not os.path.isdir(os.path.join(dirpath, name)) \
+                else ("dir", st.st_mode)
+    return out
+
+
+def _live_changes(before, after):
+    changes = []
+    for rel in sorted(set(before) | set(after)):
+        b, a = before.get(rel), after.get(rel)
+        if b == a:
+            continue
+        name = os.path.basename(rel)
+        parts = rel.split(os.sep)
+        if name in _SWEEP_WRITES or "physical-journal" in parts or name == ".DS_Store" \
+                or any(name.startswith(f".{w}.") and name.endswith(".tmp") for w in _SWEEP_WRITES):
+            continue  # launchd sweep writes (incl. its transient atomic-write temp files) and Finder metadata
+        if name == "EVENTS.jsonl" and b and a and a[0] >= b[0]:
+            continue  # append-only growth by the sweep
+        if b and a and b[0] == "dir" and a[0] == "dir":
+            continue  # directory mtime changes are implied by the checks on its entries
+        changes.append(f"{rel}: {'added' if not b else 'removed' if not a else 'modified'}")
+    return changes
+
+
+# Runtime logs the launchd sweep appends to while a rehearsal runs (its StandardOutPath, opened O_APPEND each run).
+# Such a log may only grow by appending: the same regular file (device, inode, mode) with every pre-rehearsal byte
+# intact as its prefix. It is judged by content instead of the lstat manifest; every other path stays strict.
+_APPEND_ONLY_LOGS = (os.path.join("logs", "aimem-sweep.out.log"),)
+
+
+def _append_only_snapshot(root):
+    """{rel: identity + prefix hash} of each append-only log present as a regular file (absent or not a regular
+    file: no tolerance, the manifest comparison applies unchanged)."""
+    snap = {}
+    for rel in _APPEND_ONLY_LOGS:
+        try:
+            fd = os.open(os.path.join(root, rel), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            data = fh.read(st.st_size)
+        snap[rel] = {"dev": st.st_dev, "ino": st.st_ino, "mode": st.st_mode, "size": len(data),
+                     "sha256": hashlib.sha256(data).hexdigest()}
+    return snap
+
+
+def _append_only_verdict(root, rel, before):
+    """(ok, detail) for one append-only log against its pre-rehearsal snapshot."""
+    try:
+        fd = os.open(os.path.join(root, rel), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False, "removed"
+    except OSError as e:
+        return False, f"replaced or unreadable ({e.strerror})"
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (before["dev"], before["ino"]):
+            return False, "replaced (not the same file)"
+        if st.st_mode != before["mode"]:
+            return False, "mode changed"
+        if st.st_size < before["size"]:
+            return False, f"truncated ({before['size']} -> {st.st_size} bytes)"
+        prefix = fh.read(before["size"])
+    if len(prefix) != before["size"] or hashlib.sha256(prefix).hexdigest() != before["sha256"]:
+        return False, "existing bytes modified"
+    grown = st.st_size - before["size"]
+    return True, f"appended {grown} bytes" if grown else "unchanged"
+
+
+def _live_root_changes(root, manifest_before, logs_before):
+    """(unexpected changes, expected concurrent writes) of the live root since the pre-rehearsal snapshots."""
+    changes = _live_changes({k: v for k, v in manifest_before.items() if k not in logs_before},
+                            {k: v for k, v in _live_manifest(root).items() if k not in logs_before})
+    expected = []
+    for rel, b in sorted(logs_before.items()):
+        ok, detail = _append_only_verdict(root, rel, b)
+        (expected if ok else changes).append(f"{rel}: {detail}")
+    return sorted(changes), expected
+
+
+def _remove_tree(path):
+    """Remove a rehearsal temp tree, including sealed (read-only) directories copied from the root: rmtree cannot
+    unlink the entries of a directory without owner write permission. Never follows symlinks. True when gone."""
+    for dirpath, dirnames, _ in os.walk(path):
+        for d in [dirpath] + [os.path.join(dirpath, n) for n in dirnames]:
+            try:
+                st = os.lstat(d)
+                if stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_IRWXU != stat.S_IRWXU:
+                    os.chmod(d, stat.S_IMODE(st.st_mode) | stat.S_IRWXU)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+    return not os.path.lexists(path)
+
+
+class ProjectLayoutError(ValueError):
+    """The projects/ tree of a root is not what the canonical comparison can trust; rehearsal must fail closed."""
+
+
+def _project_dirs(root):
+    """{slug: manifest} for every project directory under root/projects, failing closed on anything malformed.
+
+    Non-directory entries (Finder's .DS_Store, AppleDouble ._* files, stray notes, symlinks to files, dangling
+    links) are not projects and are skipped; pathlib's "*/" glob only restricts itself to directories on
+    Python >= 3.11, so it cannot be relied on for this. Every directory, however, is a project and must hold a
+    project.json that parses to a JSON object, and every registered slug must be such a directory: a malformed
+    project is never silently dropped from the comparison.
+    """
+    projects = Path(root) / "projects"
+    if not projects.is_dir():
+        raise ProjectLayoutError(f"{projects} is not a directory")
+    found, problems = {}, []
+    for p in sorted(projects.iterdir()):
+        if not p.is_dir():
+            continue
+        pj = p / "project.json"
+        if not pj.is_file():
+            problems.append(f"{p.name}: project directory without a project.json file")
+            continue
+        try:
+            man = json.loads(pj.read_text())
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            problems.append(f"{p.name}: unreadable project.json ({e})")
+            continue
+        if not isinstance(man, dict):
+            problems.append(f"{p.name}: project.json is not a JSON object")
+            continue
+        found[p.name] = man
+    reg_path = Path(root) / "registry" / "projects.json"
+    try:
+        registered = json.loads(reg_path.read_text()).get("projects", {})
+    except (OSError, UnicodeDecodeError, ValueError, AttributeError) as e:
+        problems.append(f"registry/projects.json unreadable ({e})")
+        registered = {}
+    for slug in sorted(registered):
+        if slug not in found and not any(x.startswith(f"{slug}: ") for x in problems):
+            problems.append(f"{slug}: registered but projects/{slug} is not a project directory")
+    if problems:
+        raise ProjectLayoutError("; ".join(problems))
+    return found
+
+
+def _canonical_snapshot(root):
+    """Hashes/counts of each project's canonical state, for the before/after rehearsal comparison."""
+    d = {}
+    for slug, man in _project_dirs(root).items():
+        p = Path(root) / "projects" / slug
+        events = 0
+        if (p / "EVENTS.jsonl").exists():
+            with open(p / "EVENTS.jsonl", "rb") as fh:
+                events = sum(1 for _ in fh)
+        d[slug] = {"CURRENT": sha(p / "CURRENT.md") if (p / "CURRENT.md").exists() else None,
+                   "NEXT": sha(p / "NEXT.md") if (p / "NEXT.md").exists() else None,
+                   "checkpoints": sorted(x.name for x in (p / "checkpoints").glob("*")) if (p / "checkpoints").exists() else [],
+                   "current_checkpoint": man.get("current_checkpoint"),
+                   "events_lines": events}
+    return d
+
+
 def rehearse(args, source_root):
+    # read-only layout check of the source first: refuse before spending a full copy of the root on it
+    try:
+        _project_dirs(source_root)
+    except ProjectLayoutError as e:
+        print(f"REHEARSAL_REFUSED=malformed projects/ layout on the source root ({e})")
+        print("MIGRATION_REHEARSAL=FAIL")
+        return 1
     tmp = Path(tempfile.mkdtemp(prefix="aimem-rehearsal-"))
+    ok = False
+    try:
+        ok = _rehearse_in(args, source_root, tmp)
+    finally:
+        # the copy holds a full duplicate of private memory: never leave it behind, including on an exception
+        if args.keep:
+            print(f"KEPT={tmp}")
+        else:
+            cleaned = _remove_tree(tmp)
+            print(f"REHEARSAL_TEMP_CLEANUP={'PASS' if cleaned else 'FAIL'} {tmp}")
+            ok = ok and cleaned
+    print(f"MIGRATION_REHEARSAL={'PASS' if ok else 'FAIL'}")
+    return 0 if ok else 1
+
+
+def _rehearse_in(args, source_root, tmp):
     copy = tmp / "AI-Memory"
     print(f"REHEARSAL_COPY={copy}")
     print(f"REHEARSAL_SOURCE={source_root}")
+    live_before = _live_manifest(source_root)
+    logs_before = _append_only_snapshot(source_root)
     shutil.copytree(source_root, copy, ignore=shutil.ignore_patterns(".locks", ".run"), symlinks=True)
+    try:
+        iso = _isolate_copy(source_root, copy, tmp)
+    except (OSError, RecursionError, shutil.Error) as e:
+        print(f"REHEARSAL_REFUSED=could not isolate the copy from live data ({e})")
+        return False
+    print("REHEARSAL_ISOLATION=" + " ".join(f"{k}={v}" for k, v in iso.items()))
     # snapshot canonical hashes for comparison
-    def canon(root):
-        d = {}
-        for p in sorted((root / "projects").glob("*/")):
-            slug = p.name
-            d[slug] = {"CURRENT": sha(p / "CURRENT.md") if (p / "CURRENT.md").exists() else None,
-                       "NEXT": sha(p / "NEXT.md") if (p / "NEXT.md").exists() else None,
-                       "checkpoints": sorted(x.name for x in (p / "checkpoints").glob("*")) if (p / "checkpoints").exists() else [],
-                       "current_checkpoint": json.loads((p / "project.json").read_text()).get("current_checkpoint"),
-                       "events_lines": sum(1 for _ in open(p / "EVENTS.jsonl")) if (p / "EVENTS.jsonl").exists() else 0}
-        return d
-    before = canon(copy)
-    pr = Promotion(copy, live=False, backup_dir=tmp / "backups", skip_selftest=args.skip_selftest)
+    try:
+        before = _canonical_snapshot(copy)
+    except ProjectLayoutError as e:
+        print(f"REHEARSAL_REFUSED=malformed projects/ layout in the rehearsal copy ({e})")
+        return False
+    pr = Promotion(copy, live=False, backup_dir=tmp / "backups", skip_selftest=args.skip_selftest, smoke_slug=args.smoke_slug,
+                   home=tmp / "home")
     rc = pr.run()
-    after = canon(copy)
     cmp = {"canonical_preserved": True, "detail": []}
+    try:
+        after = _canonical_snapshot(copy)
+    except ProjectLayoutError as e:
+        after = {}
+        cmp["canonical_preserved"] = False
+        cmp["detail"].append(f"projects/ layout broken after promotion: {e}")
     for slug in before:
         b, a = before[slug], after.get(slug, {})
         if b["CURRENT"] != a.get("CURRENT") or b["NEXT"] != a.get("NEXT"):
             cmp["canonical_preserved"] = False
             cmp["detail"].append(f"{slug}: CURRENT/NEXT changed")
-        if slug != "ai-memory" and b["current_checkpoint"] != a.get("current_checkpoint"):
+        if slug != args.smoke_slug and b["current_checkpoint"] != a.get("current_checkpoint"):
             cmp["canonical_preserved"] = False
             cmp["detail"].append(f"{slug}: current checkpoint changed")
         if not set(b["checkpoints"]).issubset(set(a.get("checkpoints", []))):
@@ -371,20 +690,17 @@ def rehearse(args, source_root):
             cmp["canonical_preserved"] = False
             cmp["detail"].append(f"{slug}: EVENTS shrank")
     print(f"REHEARSAL_CANONICAL_PRESERVED={cmp['canonical_preserved']} {cmp['detail'] or ''}")
-    live_before = canon(source_root)
-    # live root must be byte-identical in canonical files to the pre-rehearsal copy (sweep may append EVENTS/AUTO state only)
-    live_ok = all(live_before[s]["CURRENT"] == before[s]["CURRENT"] and live_before[s]["checkpoints"] == before[s]["checkpoints"] for s in before)
-    print(f"LIVE_ROOT_UNTOUCHED_BY_REHEARSAL={live_ok}")
-    rep = {"rehearsal_copy": str(copy), "promotion_result": pr.report["result"], "canonical_comparison": cmp, "live_untouched": live_ok, "gates": pr.report["gates"]}
+    # the live root must be untouched apart from what the launchd sweep may write
+    live_changes, live_expected = _live_root_changes(source_root, live_before, logs_before)
+    live_ok = not live_changes
+    print(f"LIVE_ROOT_EXPECTED_CONCURRENT_WRITES={live_expected}")
+    print(f"LIVE_ROOT_UNTOUCHED_BY_REHEARSAL={live_ok}" + (f" CHANGES={live_changes[:10]}" if live_changes else ""))
+    rep = {"rehearsal_copy": str(copy), "promotion_result": pr.report["result"], "canonical_comparison": cmp,
+           "live_untouched": live_ok, "live_changes": live_changes[:200], "live_expected_concurrent_writes": live_expected,
+           "isolation": iso, "gates": pr.report["gates"]}
     (DEV / "reports").mkdir(exist_ok=True)
     (DEV / "reports" / f"MIGRATION_REHEARSAL_{time.strftime('%Y%m%dT%H%M%S%z')}.json").write_text(json.dumps(rep, indent=2))
-    ok = rc == 0 and cmp["canonical_preserved"] and live_ok
-    print(f"MIGRATION_REHEARSAL={'PASS' if ok else 'FAIL'}")
-    if not args.keep:
-        shutil.rmtree(tmp, ignore_errors=True)
-    else:
-        print(f"KEPT={tmp}")
-    return 0 if ok else 1
+    return rc == 0 and cmp["canonical_preserved"] and live_ok
 
 
 def _resolve_root(value):
@@ -417,6 +733,11 @@ def main():
         help="reuse an already-passed selftest (rehearsal only)",
     )
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument(
+        "--smoke-slug",
+        default="ai-memory",
+        help="registered project used for the begin/step/finish smoke test (admin checkpoint, CURRENT not advanced)",
+    )
 
     a = ap.parse_args()
 
@@ -458,6 +779,7 @@ def main():
         live=True,
         backup_dir=backup_dir,
         skip_selftest=a.skip_selftest,
+        smoke_slug=a.smoke_slug,
     )
 
     raise SystemExit(pr.run())

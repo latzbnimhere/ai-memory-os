@@ -1,6 +1,6 @@
 # AI MEMORY OS V4 — AGENT PROTOCOL
 
-Root: `~/AI-Memory` (canonical, local-only, vendor-neutral). Version: 4.1.0. No API, no cloud, no telemetry.
+Root: `~/AI-Memory` (canonical, local-only, vendor-neutral). Version: 4.2.0. No API, no cloud, no telemetry.
 
 ## 1. Detect and begin
 ```bash
@@ -34,6 +34,9 @@ If more than one session is OPEN, every mutation requires `--session`; otherwise
    - `--allow-unchanged` only for a genuinely read-only phase; `--no-advance-current` for administrative checkpoints.
    - Exit 3 = VERSION_CONFLICT / CANONICAL_STATE_ADVANCED_BY_ANOTHER_SESSION: another agent advanced memory. Re-read CURRENT/NEXT,
      merge, then retry with `--expect-version <shown>`. Never overwrite blindly.
+   - Exit 4 = UNRESOLVED_TRANSACTIONS: an earlier canonical write was interrupted. Run `aimem txn "$SLUG"`; repair with
+     `aimem txn "$SLUG" --repair` only after reading it; MANUAL_TARGET_CHANGED needs a human decision (docs/RECOVERY.md).
+   - SECRET_PATTERN_REJECTED: remove the credential from CURRENT.md/NEXT.md; checkpoints are immutable.
 Truthful results only. Never claim PASS without verification.
 
 ## 5. Recovery
@@ -50,7 +53,7 @@ bounded recovery packet (`.generated/RECOVERY-<id>.md`). Nothing is rerun automa
 `aimem fact list <slug>` shows the latest fact per key; PHYSICAL_GIT facts are shown STALE when the live repo differs.
 
 ## 8. Secrets
-Never store passwords, API keys, private keys, cookies, tokens, recovery codes. `write-current` and `chat-import` reject secret patterns.
+Never store passwords, API keys, private keys, cookies, tokens, recovery codes. `write-current`, `finish`/`checkpoint` and `chat-import` reject secret patterns; generated context redacts credential shapes.
 
 ## 9. Optional global project handoffs (owner-authorized R1)
 When `registry/handoffs.json` exists, `aimem finish` / accepted checkpoint persistence

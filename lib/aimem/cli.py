@@ -68,8 +68,8 @@ def cmd_register(a):
     from . import index
     core.ensure_root()
     slug = a.slug
-    if not slug or any(c for c in slug if not (c.isalnum() or c in "-_")):
-        die("slug must be alphanumeric with - or _")
+    if not slug or any(c for c in slug if not (c.isalnum() or c in "-_")) or len(slug) > 120:
+        die("slug must be alphanumeric with - or _ (max 120 chars)")
     repo = (a.repo or "").strip()
     if repo and core.recursive_index_risk(repo):
         die(f"RECURSIVE_INDEX_RISK: {repo} overlaps the memory root {ROOT}; refusing to register.")
@@ -80,12 +80,17 @@ def cmd_register(a):
     reg["projects"][slug] = {"name": a.name or slug, "path": str(p), "repo": repo}
     for sub in ("checkpoints", "knowledge", "artifacts", "cold/step-journal", "sessions", ".generated", ".txn"):
         (p / sub).mkdir(parents=True, exist_ok=True)
-    man = core.try_load_json(p / "project.json", {}) or {}
-    man.update({"slug": slug, "name": a.name or man.get("name") or slug, "repo": repo, "updated_at": iso(), "engine_version": core.VERSION})
-    man.setdefault("created_at", iso())
-    man.setdefault("current_checkpoint", None)
-    man.setdefault("memory_version", 0)
-    atomic_write_json(p / "project.json", man)
+    from . import txn
+    with core.project_write_lock(slug):
+        # project.json is canonical (memory_version, current_checkpoint): read-modify-write under the write
+        # lock, and never while an interrupted transaction may still roll project.json forward.
+        txn.require_no_pending(slug)
+        man = core.try_load_json(p / "project.json", {}) or {}
+        man.update({"slug": slug, "name": a.name or man.get("name") or slug, "repo": repo, "updated_at": iso(), "engine_version": core.VERSION})
+        man.setdefault("created_at", iso())
+        man.setdefault("current_checkpoint", None)
+        man.setdefault("memory_version", 0)
+        atomic_write_json(p / "project.json", man)
     for f in ("DECISIONS.jsonl", "EVENTS.jsonl", "ARTIFACTS.jsonl", "PROVENANCE.jsonl"):
         (p / f).touch()
     tmpl = ROOT / "templates"
@@ -98,7 +103,7 @@ def cmd_register(a):
     core.save_registry(reg)
     append_jsonl(p / "EVENTS.jsonl", {"time": iso(), "kind": "project_registered", "slug": slug, "repo": repo})
     core.rebuild_master_index()
-    index.reindex(slug, quiet=True)
+    index.reindex(slug, quiet=True, best_effort=True)
     core.git_memory_commit(f"{slug}: registered")
     print(f"REGISTERED={slug} repo={repo or '(none)'}")
 
@@ -112,7 +117,7 @@ def cmd_doctor(a):
 
 def cmd_reindex(a):
     from . import index
-    index.reindex(a.slug)
+    index.reindex(a.slug, full=a.full)
 
 
 def cmd_search(a):
@@ -168,7 +173,7 @@ def cmd_heartbeat(a):
 def cmd_finish(a):
     from . import sessions
     cp, version = sessions.finish(a.slug, a.session, a.result, a.label, a.summary or "", a.allow_unchanged, a.no_advance_current,
-                                  a.expect_version, a.acknowledge_newer)
+                                  a.expect_version, a.acknowledge_newer, a.allow_secret_pattern)
     print("FINISH=PASS")
     print(f"CHECKPOINT={cp}")
     print(f"MEMORY_VERSION={version}")
@@ -177,9 +182,10 @@ def cmd_finish(a):
 def cmd_checkpoint(a):
     from . import sessions
     core.ensure_root()
-    cp, version = sessions.create_checkpoint(a.slug, a.label, a.result, a.summary or "", a.session, not a.no_advance_current, a.expect_version)
+    cp, version = sessions.create_checkpoint(a.slug, a.label, a.result, a.summary or "", a.session, not a.no_advance_current, a.expect_version,
+                                             a.allow_secret_pattern)
     from . import index
-    index.reindex(a.slug, quiet=True)
+    index.reindex(a.slug, quiet=True, best_effort=True)
     print(cp)
     print(f"MEMORY_VERSION={version}")
 
@@ -239,20 +245,34 @@ def cmd_write_current(a):
 def cmd_txn(a):
     from . import txn
     core.ensure_root()
+    if a.discard:
+        if not a.slug:
+            die("--discard requires an explicit project slug")
+        info = txn.discard(a.slug, a.discard, force=a.force)
+        print(f"TXN_DISCARDED={a.discard} previous_state={info['previous_state']} resolution={info['resolution']}")
+        print(f"QUARANTINED_TO={info['quarantine']}")
+        for t in info["never_applied"]:
+            print(f"NEVER_APPLIED={t} (its staged content is preserved in the quarantine dir)")
+        for t in info["already_applied"]:
+            print(f"ALREADY_APPLIED_NOT_REVERTED={t} (verify this file)")
+        return
     slugs = [a.slug] if a.slug else core.all_slugs()
     total = 0
+    manual = 0
     for slug in slugs:
         if a.repair:
             for rid, action in txn.repair(slug):
                 print(f"{slug}\t{rid}\t{action}")
                 total += 1
+                manual += "MANUAL" in action
         else:
             for t in txn.inspect(slug):
                 total += 1
                 print(f"{slug}\t{t['id']}\tstate={t['state']}\tresolution={t['resolution']}\ttargets={[Path(x).name for x in t['targets']]}")
     if not total:
         print("NO_PENDING_TRANSACTIONS")
-    elif not a.repair:
+    elif not a.repair or manual:
+        # still pending (inspection only, or repair left transactions for a human): writes stay blocked
         raise SystemExit(core.EXIT_RECOVERY_REQUIRED)
 
 
@@ -326,7 +346,7 @@ def cmd_compact(a):
     if not a.dry_run:
         from . import index
         for slug in slugs:
-            index.reindex(slug, quiet=True)
+            index.reindex(slug, quiet=True, best_effort=True)
 
 
 def cmd_objects(a):
@@ -365,10 +385,13 @@ def cmd_artifact(a):
 
 def cmd_capture(a):
     from . import provenance
+    from . import txn
     core.ensure_root()
     p = project_dir(a.slug)
     state = core.repo_state_for(a.slug)
-    atomic_write_json(p / "REPO_STATE.json", state)
+    with core.project_write_lock(a.slug):
+        txn.require_no_pending(a.slug)  # REPO_STATE.json may be a target of an interrupted transaction
+        atomic_write_json(p / "REPO_STATE.json", state)
     append_jsonl(p / "EVENTS.jsonl", {"time": iso(), "kind": "repo_capture", "repo_state": state})
     provenance.record_physical_git(a.slug, state, session=a.session, source_ref="capture")
     print(json.dumps(state, indent=2))
@@ -560,18 +583,18 @@ def build_parser():
     p = sp.add_parser("status"); p.set_defaults(func=cmd_status)
     p = sp.add_parser("register"); p.add_argument("slug"); p.add_argument("--name"); p.add_argument("--repo"); p.add_argument("--update", action="store_true"); p.set_defaults(func=cmd_register)
     p = sp.add_parser("doctor"); p.add_argument("--deep", action="store_true"); p.add_argument("--repair", action="store_true"); p.add_argument("--no-repo", action="store_true", help="skip live repo checks"); p.add_argument("--slug"); p.set_defaults(func=cmd_doctor)
-    p = sp.add_parser("reindex"); p.add_argument("slug", nargs="?"); p.set_defaults(func=cmd_reindex)
+    p = sp.add_parser("reindex", help="refresh the derived search index (incremental; --full rebuilds)"); p.add_argument("slug", nargs="?"); p.add_argument("--full", action="store_true"); p.set_defaults(func=cmd_reindex)
     p = sp.add_parser("search"); p.add_argument("slug", nargs="?"); p.add_argument("query"); p.add_argument("--all", action="store_true"); p.add_argument("--limit", type=int, default=10); p.set_defaults(func=cmd_search)
     p = sp.add_parser("context"); p.add_argument("slug"); p.add_argument("--query", default=""); p.add_argument("--tokens", type=int); p.add_argument("--mode", choices=["hot", "smart", "deep"], default="smart"); p.add_argument("--output"); p.add_argument("--stdout", action="store_true"); p.set_defaults(func=cmd_context)
 
     p = sp.add_parser("begin"); p.add_argument("slug"); p.add_argument("--agent", choices=AGENTS, required=True); p.add_argument("--task", required=True); p.add_argument("--tokens", type=int); p.add_argument("--mode", choices=["hot", "smart", "deep"], default="smart"); p.set_defaults(func=cmd_begin)
     p = sp.add_parser("heartbeat"); p.add_argument("slug"); p.add_argument("--session"); p.add_argument("--note"); p.set_defaults(func=cmd_heartbeat)
-    p = sp.add_parser("finish"); p.add_argument("slug"); p.add_argument("--session"); p.add_argument("--result", required=True); p.add_argument("--label"); p.add_argument("--summary"); p.add_argument("--allow-unchanged", action="store_true"); p.add_argument("--no-advance-current", action="store_true"); p.add_argument("--expect-version", type=int); p.add_argument("--acknowledge-newer", action="store_true", help="finish even though another session advanced memory (you merged it)"); p.set_defaults(func=cmd_finish)
-    p = sp.add_parser("checkpoint"); p.add_argument("slug"); p.add_argument("--label", required=True); p.add_argument("--result", required=True); p.add_argument("--summary"); p.add_argument("--session"); p.add_argument("--no-advance-current", action="store_true"); p.add_argument("--expect-version", type=int); p.set_defaults(func=cmd_checkpoint)
+    p = sp.add_parser("finish"); p.add_argument("slug"); p.add_argument("--session"); p.add_argument("--result", required=True); p.add_argument("--label"); p.add_argument("--summary"); p.add_argument("--allow-unchanged", action="store_true"); p.add_argument("--no-advance-current", action="store_true"); p.add_argument("--expect-version", type=int); p.add_argument("--acknowledge-newer", action="store_true", help="finish even though another session advanced memory (you merged it)"); p.add_argument("--allow-secret-pattern", action="store_true", help="seal even though CURRENT/NEXT match a secret pattern (verified false positive)"); p.set_defaults(func=cmd_finish)
+    p = sp.add_parser("checkpoint"); p.add_argument("slug"); p.add_argument("--label", required=True); p.add_argument("--result", required=True); p.add_argument("--summary"); p.add_argument("--session"); p.add_argument("--no-advance-current", action="store_true"); p.add_argument("--expect-version", type=int); p.add_argument("--allow-secret-pattern", action="store_true"); p.set_defaults(func=cmd_checkpoint)
     p = sp.add_parser("sessions"); p.add_argument("slug", nargs="?"); p.add_argument("--open", action="store_true"); p.set_defaults(func=cmd_sessions)
     p = sp.add_parser("session"); p.add_argument("action", choices=["close", "show"]); p.add_argument("slug"); p.add_argument("--session"); p.add_argument("--result", default="ABANDONED"); p.add_argument("--note"); p.set_defaults(func=cmd_session)
     p = sp.add_parser("write-current", help="transactional CAS write of CURRENT.md/NEXT.md from files"); p.add_argument("slug"); p.add_argument("--current"); p.add_argument("--next"); p.add_argument("--session"); p.add_argument("--expect-version", type=int); p.add_argument("--allow-secret-pattern", action="store_true"); p.set_defaults(func=cmd_write_current)
-    p = sp.add_parser("txn"); p.add_argument("slug", nargs="?"); p.add_argument("--repair", action="store_true"); p.set_defaults(func=cmd_txn)
+    p = sp.add_parser("txn"); p.add_argument("slug", nargs="?"); g = p.add_mutually_exclusive_group(); g.add_argument("--repair", action="store_true"); g.add_argument("--discard", metavar="TXID", help="abandon one pending transaction after manual review (quarantined, never automatic)"); p.add_argument("--force", action="store_true", help="with --discard: also discard a transaction that could be rolled forward cleanly"); p.set_defaults(func=cmd_txn)
 
     p = sp.add_parser("recover"); p.add_argument("slug", nargs="?"); p.add_argument("--session"); p.set_defaults(func=cmd_recover)
     p = sp.add_parser("reconcile"); p.add_argument("slug"); p.set_defaults(func=cmd_reconcile)
@@ -604,10 +627,31 @@ def build_parser():
     return ap
 
 
+# Commands whose positional slug may name a project that does not exist yet.
+_SLUG_MAY_BE_NEW = {"register"}
+
+
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
-    args.func(args)
+    slug = getattr(args, "slug", None)
+    if slug and args.cmd not in _SLUG_MAY_BE_NEW:
+        # Fail closed before any command can create stray directories/journals for a typo'd or unsafe slug.
+        # A registered project whose project.json is missing/damaged is still accepted, so diagnostic and
+        # repair commands (doctor --slug, txn --repair, recover, health) can reach it.
+        core.ensure_root()
+        core.safe_component(slug, "slug")
+        if not (core.project_exists(slug) or slug in core.all_slugs()):
+            die(f"Unknown project: {slug} (registered: {', '.join(core.all_slugs()) or 'none'})")
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        # stdout closed early (e.g. `aimem search ... | head`): not an error of the command itself
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        raise SystemExit(0)
 
 
 if __name__ == "__main__":

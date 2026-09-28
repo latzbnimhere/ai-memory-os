@@ -11,3 +11,23 @@ errors after the last PASS, PASS steps that must not be repeated, unresolved tra
 Resolution: verify physical state; `aimem session close <slug> --session <id> --result ABANDONED --note "..."`; continue in a new
 session. Interrupted canonical writes: `aimem txn <slug>` (inspect) then `aimem txn <slug> --repair` (PREPARED with complete
 staging or COMMITTING -> roll forward; PREPARED with missing staging -> roll back; anything else -> manual review).
+While a transaction is pending, finish/checkpoint/write-current fail closed with exit 4 (`UNRESOLVED_TRANSACTIONS`).
+`MANUAL_TARGET_CHANGED`: a target was rewritten after the interruption (it matches neither its pre-image nor the staged
+content). Repair will not apply the stale staged copy. Compare the staged file (`.<name>.<txid>.staged`) with the live
+file and keep the correct content. Then abandon the transaction with `aimem txn <slug> --discard <txid>`: the record and
+staged files are moved to `cold/quarantine/txn-<txid>/` (nothing is deleted), the decision is journaled, and the command
+lists targets that were never applied and targets a COMMITTING transaction had already replaced. A transaction that
+`--repair` could roll forward cleanly is refused unless `--force` is given.
+Transaction records store project-relative paths: repairing a moved or copied root repairs that root, never the original
+location. Legacy records whose absolute paths point outside the current project are left for manual review.
+`PREPARED` transactions never replaced anything; if a target changed since, repair rolls them back (discarding only the
+unapplied staged content).
+
+Torn journal lines (a crash mid-append): `aimem doctor` reports `invalid JSONL <file>:<line>`; later appends start on a
+new line, so only that line is affected. `aimem doctor --repair` moves unparseable lines out of the journal in place
+(under the append lock) and preserves the complete original as `cold/quarantine/<file>.<stamp>.orig` plus the bad lines
+as `.bad`.
+
+Incomplete checkpoints (a directory under `checkpoints/` without `meta.json`, or a V4 checkpoint without `txn` left by a
+refused finish in an engine older than 4.2) are reported by `doctor --deep`, ignored by index and context, and never
+deleted automatically. Archive them manually after review.

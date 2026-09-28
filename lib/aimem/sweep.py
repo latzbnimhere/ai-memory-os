@@ -24,7 +24,10 @@ def main(argv=None):
     changed = 0
     lease_summary = {}
     for slug, rec in reg.get("projects", {}).items():
-        p = project_dir(slug)
+        try:
+            p = project_dir(slug)
+        except SystemExit:
+            continue  # unsafe slug in registry: doctor reports it; the sweep never writes outside the root
         if not p.exists():
             continue
         opens = []
@@ -73,8 +76,8 @@ def main(argv=None):
                             sj.get("id"),
                             note="sweep: fresh physical project activity observed",
                         )
-                    except Exception:
-                        pass
+                    except (Exception, SystemExit):
+                        pass  # session closed/locked concurrently: never fatal for the sweep
 
             changed += 1
         atomic_write_json(state_path, state)

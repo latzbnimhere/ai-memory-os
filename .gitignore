@@ -35,3 +35,6 @@ backups/
 
 # Local publication safety marker
 .DO_NOT_PUBLISH
+
+# Promotion/rehearsal reports (contain local absolute paths)
+reports/

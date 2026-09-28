@@ -1,6 +1,7 @@
 """Unit tests for AI Memory OS V4 internals (stdlib unittest; isolated temp root)."""
 from __future__ import annotations
 
+import _isolation  # noqa: F401  (must precede any aimem import; see tests/_isolation.py)
 import json
 import os
 import shutil
@@ -11,6 +12,8 @@ import unittest
 from pathlib import Path
 
 TMP = Path(tempfile.mkdtemp(prefix="aimem-unit-"))
+import atexit  # noqa: E402
+atexit.register(shutil.rmtree, TMP, True)
 ROOT = TMP / "memory"
 os.environ["AI_MEMORY_ROOT"] = str(ROOT)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))

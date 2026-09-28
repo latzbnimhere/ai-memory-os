@@ -17,6 +17,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from .core import VERSION as ENGINE_VERSION  # constant only; the selftest drives aimem via subprocesses
+
 BIN = Path(__file__).resolve().parents[2] / "bin"
 PY = sys.executable
 
@@ -30,7 +32,10 @@ class T:
         self.repo2 = self.tmp / "repo2"
         self.bk = self.tmp / "backups"
         self.results = []
-        self.env = dict(os.environ, AI_MEMORY_ROOT=str(self.root), AIMEM_SELFTEST="1")
+        # private HOME: selftest children never read the owner's LaunchAgents, ~/.claude, backups or Drive
+        (self.tmp / "home").mkdir(parents=True, exist_ok=True)
+        self.env = dict(os.environ, AI_MEMORY_ROOT=str(self.root), AIMEM_SELFTEST="1", HOME=str(self.tmp / "home"),
+                        GIT_CONFIG_NOSYSTEM="1")
         self.env.pop("AIMEM_SESSION_ID", None)
 
     # ------------------------------------------------------------ helpers
@@ -51,7 +56,7 @@ class T:
         return r.returncode, r.stdout + r.stderr
 
     def git(self, repo, *a):
-        return subprocess.run(["git", "-C", str(repo)] + list(a), capture_output=True, text=True, timeout=30)
+        return subprocess.run(["git", "-C", str(repo)] + list(a), capture_output=True, text=True, timeout=30, env=self.env)
 
     def val(self, out, key):
         for line in out.splitlines():
@@ -99,7 +104,7 @@ class T:
         cfg["dashboard_port"] = 0
         (self.root / "config.json").write_text(json.dumps(cfg, indent=2))
         rc, out = self.run("aimem", "version", rc=0)
-        assert "aimem 4.1." in out
+        assert f"aimem {ENGINE_VERSION}" in out
 
     def t_register(self):
         self.make_repo(self.repo)
@@ -434,7 +439,7 @@ do the thing
     def t_health(self):
         rc, out = self.run("aimem", "health", "--verbose")
         assert rc in (0, 1), out
-        for k in ("AI_MEMORY_HEALTH=", "version=4.1.", "projects=2", "active_sessions=", "database=", "backup_status=", "disk_usage=", "unresolved_transactions=0", "recovery_required=0"):
+        for k in ("AI_MEMORY_HEALTH=", f"version={ENGINE_VERSION}", "projects=2", "active_sessions=", "database=", "backup_status=", "disk_usage=", "unresolved_transactions=0", "recovery_required=0"):
             assert k in out, f"missing {k}: {out}"
         rc, out = self.run("aimem", "health", "--json", rc=None)
         json.loads(out)

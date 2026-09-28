@@ -1,6 +1,6 @@
 # AI MEMORY AUTOPILOT (V4)
 
-This machine uses `~/AI-Memory` (AI Memory OS 4.1.0) as vendor-neutral project continuation memory.
+This machine uses `~/AI-Memory` (AI Memory OS 4.2.0) as vendor-neutral project continuation memory.
 Full protocol: `~/AI-Memory/AI_MEMORY_AGENT_PROTOCOL_V4.md`.
 
 Activate for meaningful work when `~/AI-Memory/bin/aimem-detect "$PWD"` prints a slug:

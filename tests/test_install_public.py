@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import _isolation  # noqa: F401  (must precede any aimem import; see tests/_isolation.py)
 import os
 import subprocess
 import sys
@@ -55,7 +56,7 @@ class TestFreshInstall(unittest.TestCase):
             self.assertTrue((root / "lib" / "aimem" / "core.py").is_file())
             self.assertTrue((root / "registry" / "projects.json").is_file())
             self.assertTrue((root / "AI_MEMORY_AGENT_PROTOCOL_V4.md").is_file())
-            self.assertEqual((root / "VERSION").read_text(encoding="utf-8").strip(), "4.1.0")
+            self.assertEqual((root / "VERSION").read_text(encoding="utf-8").strip(), (REPO / "VERSION").read_text(encoding="utf-8").strip())
 
             env = dict(os.environ, AI_MEMORY_ROOT=str(root))
             doctor = subprocess.run(
