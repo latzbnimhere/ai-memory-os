@@ -220,6 +220,23 @@ def project_entry(reg, slug):
     return e
 
 
+def publish_exclude(reg, slug):
+    """Per-project, owner-configured journals withheld from the Drive mirror (local memory stays intact)."""
+    vals = list((reg["projects"].get(slug) or {}).get("publish_exclude") or [])
+    bad = [v for v in vals if v not in JOURNALS]
+    if bad:
+        raise DriveError("INVALID_PUBLISH_EXCLUDE", f"{slug}: only {', '.join(JOURNALS)} may be excluded, got {bad}")
+    return sorted(set(vals))
+
+
+WITHHELD_EVENTS = ("\n---\n## RECENT EVENTS\nAUTHORITY: WITHHELD\n(withheld: EVENTS.jsonl is excluded from this "
+                   "project's Drive mirror by owner policy; local memory is intact)")
+
+
+def withhold_events_section(ctx):
+    return re.sub(r"\n---\n## RECENT EVENTS\n.*?(?=\n---\n)", lambda _m: WITHHELD_EVENTS, ctx, count=1, flags=re.S)
+
+
 def project_path(reg, slug, root=None):
     root = root or root_path(reg)
     e = project_entry(reg, slug)
@@ -525,6 +542,7 @@ def snapshot(slug, reg, version, generation, backfill=0, mode="canonical"):
     from . import context as ctxmod, reconcile
     p = core.project_dir(slug)
     settings = reg["settings"]
+    excluded = publish_exclude(reg, slug)
     live = core.repo_state_for(slug)  # fresh physical state (read-only git), outside the lock
     rec = reconcile.reconcile(slug, live)
     stage = Path(tempfile.mkdtemp(prefix=f"stage-{slug}-", dir=str(work())))
@@ -555,7 +573,7 @@ def snapshot(slug, reg, version, generation, backfill=0, mode="canonical"):
         put("CURRENT.md", cur_b, "hot")
         put("NEXT.md", nxt_b, "hot")
         for j in JOURNALS:
-            if (p / j).exists():
+            if (p / j).exists() and j not in excluded:
                 put(j, (p / j).read_bytes(), "journal")
         if (p / "PROVENANCE.jsonl").exists():
             put("EVIDENCE_INDEX/PROVENANCE.jsonl", (p / "PROVENANCE.jsonl").read_bytes(), "index")
@@ -591,7 +609,7 @@ def snapshot(slug, reg, version, generation, backfill=0, mode="canonical"):
                                "next_sha256": cm.get("next_sha256"), "repo_head": (cm.get("repo_state") or {}).get("head"),
                                "has_meta": bool(cm), "is_current": cid == cp_id,
                                "mirrored_dir": f"CHECKPOINTS/{cid}/" if cid in mirrored else None})
-        events = core.read_jsonl(p / "EVENTS.jsonl")
+        events = [] if "EVENTS.jsonl" in excluded else core.read_jsonl(p / "EVENTS.jsonl")
         artifacts = core.read_jsonl(p / "ARTIFACTS.jsonl")
         man_after = core.project_manifest(slug)
     cur_sha, nxt_sha = sha256_bytes(cur_b), sha256_bytes(nxt_b)
@@ -617,10 +635,13 @@ def snapshot(slug, reg, version, generation, backfill=0, mode="canonical"):
                                          "canonical_matches_checkpoint": source["canonical_matches_checkpoint"],
                                          "mirrored_dir": f"CHECKPOINTS/{cp_id}/" if cp_id in mirrored else None}), "hot")
     put("CHECKPOINTS/INDEX.jsonl", "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in index_rows), "index")
-    put("EVIDENCE_INDEX/INDEX.json", dumps({
+    evidence = {
         "schema": SCHEMA, "slug": slug, "latest_facts": _latest_facts(slug),
         "recent_evidence_steps": _evidence_steps(events), "full_provenance": "EVIDENCE_INDEX/PROVENANCE.jsonl",
-        "cold_rule": "Large evidence stays local (paths/hashes here) or in EVIDENCE_INDEX/cold/ via aimem drive attach."}), "index")
+        "cold_rule": "Large evidence stays local (paths/hashes here) or in EVIDENCE_INDEX/cold/ via aimem drive attach."}
+    if excluded:
+        evidence["withheld_by_owner_policy"] = excluded
+    put("EVIDENCE_INDEX/INDEX.json", dumps(evidence), "index")
     attachments = (load_state(slug) or {}).get("attachments", [])
     put("ARTIFACT_INDEX/INDEX.json", dumps({
         "schema": SCHEMA, "slug": slug, "artifact_count": len(artifacts),
@@ -638,6 +659,8 @@ def snapshot(slug, reg, version, generation, backfill=0, mode="canonical"):
                                      "references": prefs,
                                      "rule": "Operational prompts/instructions only; never hidden reasoning or secrets."}), "prompt")
     ctx = ctxmod.build_context(slug, "", int(settings["handoff_context_tokens"]), "deep", reconciliation=rec, live_repo=live)
+    if "EVENTS.jsonl" in excluded:
+        ctx = withhold_events_section(ctx)
     bridge = _handoff_section(slug)
     handoff_md = "\n".join([
         f"# {man_after.get('name', slug)} — LATEST HANDOFF (AI Memory Drive mirror)", "",
@@ -651,6 +674,7 @@ def snapshot(slug, reg, version, generation, backfill=0, mode="canonical"):
         f"PHYSICAL_AT_PUBLISH: head={physical.get('head')} branch={physical.get('branch')} dirty={physical.get('dirty')} "
         f"captured_at={physical.get('captured_at')}",
         f"RECONCILIATION_AT_PUBLISH: {rec['status']}" + (f" flags={','.join(rec['flags'])}" if rec["flags"] else ""), "",
+        *([f"WITHHELD_FROM_MIRROR_BY_OWNER_POLICY: {', '.join(excluded)} (local memory intact)"] if excluded else []),
         LAW, "", "READ ORDER: " + " -> ".join(READ_ORDER), HOT_RULE, PROPOSAL_RULE, "",
         "## Navigation handoff (bridge R1 render from the same local sources)" if bridge else "",
         bridge.strip() if bridge else "", "",
@@ -658,7 +682,7 @@ def snapshot(slug, reg, version, generation, backfill=0, mode="canonical"):
     put("LATEST_HANDOFF.md", handoff_md, "hot")
     info = {"source": source, "physical": physical, "reconciliation": {"status": rec["status"], "flags": rec["flags"]},
             "files": files, "checkpoints_mirrored": mirrored, "memory_version_before": int(man.get("memory_version", 0)),
-            "prompt_references": prefs}
+            "prompt_references": prefs, "publish_exclude": excluded}
     if info["memory_version_before"] != source["memory_version"]:
         shutil.rmtree(stage, ignore_errors=True)
         raise DriveError("LOCAL_CHANGED_DURING_SNAPSHOT", "retry", core.EXIT_WARN)
@@ -844,6 +868,7 @@ def push(slug, agent="unknown", session=None, timeout=None, wait=True, allow_sec
                              "root_name": ROOT_NAME, "project_folder": e["folder"]},
                 "source": src, "physical": info["physical"], "reconciliation": info["reconciliation"],
                 "current_version_dir": vdir, "files": files, "checkpoints_mirrored": info["checkpoints_mirrored"],
+                **({"withheld_by_owner_policy": info["publish_exclude"]} if info["publish_exclude"] else {}),
                 "content_cloud_ack": {"status": ack["status"], "source": ack["source"], "elapsed_s": ack["elapsed_s"]},
                 "read_order": READ_ORDER, "hot_context_rule": HOT_RULE, "proposal_rule": PROPOSAL_RULE,
                 "authority_law": LAW, "notes": notes}
@@ -1023,7 +1048,8 @@ def verify(slug, timeout=None):
         vdir = remote.get("current_version_dir") or ""
         r["VERSION_DIR_COMPLETE"] = "PASS" if vdir and all(mounts.get(f"{vdir}/{n}") == "OK" for n in HOT) else "FAIL"
         hot_hits = []
-        for rel in list(HOT) + list(JOURNALS) + [MANIFEST]:
+        r["WITHHELD_BY_OWNER_POLICY"] = ",".join(publish_exclude(reg, slug)) or "NONE"
+        for rel in list(HOT) + [j for j in JOURNALS if j not in publish_exclude(reg, slug)] + [MANIFEST]:
             f = pdir / rel
             if f.is_file():
                 h = secret_hits(f.read_text(errors="ignore"))
@@ -1211,7 +1237,7 @@ def pin(account=None, accept_new_root=None):
         return reg["root"]
 
 
-def register(slug, folder=None):
+def register(slug, folder=None, exclude=None):
     core.safe_component(slug, "slug")
     if not core.project_exists(slug):
         raise DriveError("UNKNOWN_PROJECT", slug)
@@ -1234,8 +1260,14 @@ def register(slug, folder=None):
         old = reg["projects"].get(slug)
         if old and old.get("item_id") and old["item_id"] != fid:
             raise DriveError("PROJECT_FOLDER_ID_CHANGED", f"pinned {old['item_id']} now {fid}", core.EXIT_CONFLICT)
-        reg["projects"][slug] = {"folder": folder, "item_id": fid, "enabled": True,
-                                 "registered_at": (old or {}).get("registered_at") or iso()}
+        entry = {"folder": folder, "item_id": fid, "enabled": True,
+                 "registered_at": (old or {}).get("registered_at") or iso()}
+        excl = sorted(set(exclude if exclude is not None else (old or {}).get("publish_exclude") or []))
+        if [v for v in excl if v not in JOURNALS]:
+            raise DriveError("INVALID_PUBLISH_EXCLUDE", f"only {', '.join(JOURNALS)} may be excluded")
+        if excl:
+            entry["publish_exclude"] = excl
+        reg["projects"][slug] = entry
         save_reg(reg)
         return reg["projects"][slug]
 
@@ -1365,8 +1397,9 @@ def cli(a):
             print(f"DRIVE_ROOT_PINNED scheme={r['identity_scheme']} item_id={r['item_id']} my_drive={r['my_drive_item_id']}")
             return
         if act == "register":
-            r = register(a.slug, a.folder)
-            print(f"DRIVE_PROJECT_REGISTERED slug={a.slug} folder={r['folder']} item_id={r['item_id']}")
+            r = register(a.slug, a.folder, a.exclude)
+            print(f"DRIVE_PROJECT_REGISTERED slug={a.slug} folder={r['folder']} item_id={r['item_id']}"
+                  + (f" withheld={','.join(r['publish_exclude'])}" if r.get("publish_exclude") else ""))
             return
         if act == "status":
             _print(status(a.slug))
@@ -1422,6 +1455,8 @@ def add_parser(sp):
     q.add_argument("--account"); q.add_argument("--accept-new-root", metavar="ITEM_ID")
     q = d.add_parser("register", help="create/pin <root>/<folder> for a registered project")
     q.add_argument("slug"); q.add_argument("--folder")
+    q.add_argument("--exclude", action="append", choices=list(JOURNALS),
+                   help="withhold this journal from the project's Drive mirror (repeatable; local memory unchanged)")
     for name in ("status", "pull"):
         q = d.add_parser(name); q.add_argument("slug")
     q = d.add_parser("push", help="atomic publish with remote readback")

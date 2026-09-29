@@ -430,6 +430,65 @@ class DriveMirrorTests(unittest.TestCase):
         self.assertTrue(any(r.get("title") == "legacy handoff listing truncated" for r in refs))
         self.assertTrue(any(r.get("title") == "bridge CHATGPT_HANDOFF.md" for r in refs))
 
+    def _second_project(self):
+        quiet(cli.main, ["register", "other", "--name", "Other", "--repo", str(self.repo)])
+        state, _ = quiet(sessions.begin, "other", "claude", "seed other")
+        (core.project_dir("other") / "CURRENT.md").write_text("# Other CURRENT\n")
+        quiet(sessions.finish, "other", session=state["id"], result="PASS", label="seed other")
+        drive.register("other")
+        for slug in ("dummy", "other"):
+            core.append_jsonl(core.project_dir(slug) / "EVENTS.jsonl",
+                              {"time": core.iso(), "kind": "operational_step", "step_kind": "error",
+                               "summary": f"EVENT_MARKER_{slug}", "session_id": "S"})
+
+    def test_journal_exclusion_is_scoped_to_one_project(self):
+        self._second_project()
+        local_events = core.sha256_file(self.p / "EVENTS.jsonl")
+        before = self.canon()
+        r = drive.register("dummy", exclude=["EVENTS.jsonl"])
+        self.assertEqual(r["publish_exclude"], ["EVENTS.jsonl"])
+        self.assertEqual(drive.push("dummy")["status"], "VERIFIED")
+        self.assertEqual(drive.push("other")["status"], "VERIFIED")
+        m = self.manifest()
+        self.assertNotIn("EVENTS.jsonl", m["files"])
+        self.assertFalse((self.pdir / "EVENTS.jsonl").exists())
+        self.assertEqual(m["withheld_by_owner_policy"], ["EVENTS.jsonl"])
+        published = "".join((self.pdir / rel).read_text(errors="ignore") for rel in m["files"])
+        self.assertNotIn("EVENT_MARKER_dummy", published, "no excerpt of the excluded journal anywhere")
+        hand = (self.pdir / "LATEST_HANDOFF.md").read_text()
+        self.assertIn("WITHHELD_FROM_MIRROR_BY_OWNER_POLICY: EVENTS.jsonl", hand)
+        self.assertIn("## RECENT EVENTS\nAUTHORITY: WITHHELD", hand)
+        self.assertEqual(json.loads((self.pdir / "EVIDENCE_INDEX" / "INDEX.json").read_text())["recent_evidence_steps"], [])
+        self.assertIn("DECISIONS.jsonl", m["files"], "only the named journal is withheld")
+        self.assertEqual(core.sha256_file(self.p / "EVENTS.jsonl"), local_events, "local journal intact")
+        self.assertEqual(self.canon(), before)
+        v = drive.verify("dummy")
+        self.assertEqual((v["REMOTE_READBACK"], v["LOCAL_MATCH"], v["WITHHELD_BY_OWNER_POLICY"]), ("PASS", "YES", "EVENTS.jsonl"))
+        other = self.droot / "other"
+        om = json.loads((other / "MANIFEST.json").read_text())
+        self.assertIn("EVENTS.jsonl", om["files"])
+        self.assertNotIn("withheld_by_owner_policy", om)
+        self.assertIn("EVENT_MARKER_other", (other / "EVENTS.jsonl").read_text())
+        self.assertNotIn("WITHHELD", (other / "LATEST_HANDOFF.md").read_text())
+        oi = json.loads((other / "EVIDENCE_INDEX" / "INDEX.json").read_text())
+        self.assertNotIn("withheld_by_owner_policy", oi)
+        self.assertTrue(any(x.get("summary") == "EVENT_MARKER_other" for x in oi["recent_evidence_steps"]))
+        self.assertEqual(drive.verify("other")["WITHHELD_BY_OWNER_POLICY"], "NONE")
+
+    def test_journal_exclusion_validation_and_persistence(self):
+        with self.assertRaises(drive.DriveError) as c:
+            drive.register("dummy", exclude=["CURRENT.md"])
+        self.assertEqual(c.exception.code, "INVALID_PUBLISH_EXCLUDE")
+        drive.register("dummy", exclude=["EVENTS.jsonl"])
+        self.assertEqual(drive.register("dummy")["publish_exclude"], ["EVENTS.jsonl"], "re-register keeps the option")
+        reg = json.loads(drive.reg_path().read_text())
+        reg["projects"]["dummy"]["publish_exclude"] = ["NEXT.md"]
+        drive.reg_path().write_text(json.dumps(reg))
+        with self.assertRaises(drive.DriveError) as c:
+            drive.push("dummy")
+        self.assertEqual(c.exception.code, "INVALID_PUBLISH_EXCLUDE")
+        self.assertFalse((self.pdir / "MANIFEST.json").exists(), "fails closed before publishing anything")
+
     def test_unregistered_project_is_noop(self):
         quiet(cli.main, ["register", "other", "--name", "Other"])
         state, out = quiet(sessions.begin, "other", "claude", "x")

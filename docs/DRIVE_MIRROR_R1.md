@@ -36,6 +36,12 @@ project's handoff-bridge folder plus files directly inside first-level folders e
 `settings.legacy_prompt_max_files` (default 40, hard ceiling 100) files are taken, and a truncation note is recorded
 when the cap is hit. Generated names longer than 150 characters are shortened with a stable hash.
 
+Per-project journal withholding (owner decision per project): `aimem drive register <slug> --exclude EVENTS.jsonl`
+records `publish_exclude` in the local registry. That project's mirror then omits the journal file and every excerpt
+derived from it (the context pack's RECENT EVENTS section is replaced by a WITHHELD marker; EVIDENCE_INDEX recent steps
+are empty), and MANIFEST.json / LATEST_HANDOFF.md say what is withheld. Local memory is never edited. Only journal names
+are accepted; any other value fails closed before anything is published. Projects without the option are unaffected.
+
 Large binary evidence is never uploaded by default: indexes carry hashes, sizes and local paths. `aimem drive attach`
 uploads one file to a `cold/` folder explicitly (size-capped, secret-scanned when textual).
 
