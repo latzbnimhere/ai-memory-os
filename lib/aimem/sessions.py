@@ -167,6 +167,11 @@ def begin(slug, agent, task, tokens=None, mode="smart"):
         out.append("WARN=OTHER_OPEN_SESSION_EXISTS " + ",".join(others))
     if pending_txn:
         out.append(f"WARN=UNRESOLVED_TRANSACTIONS={len(pending_txn)} (run: aimem txn {slug})")
+    try:  # optional, read-only, time-bounded Drive mirror reconciliation; never fails begin
+        from . import drive
+        out.extend(drive.begin_lines(slug, session_id))
+    except (Exception, SystemExit):
+        out.append("DRIVE_STATE=UNAVAILABLE")
     return state, out
 
 
@@ -250,11 +255,11 @@ def create_checkpoint(slug, label, result, summary="", session_id=None, advance_
                            evidence_sha256=meta["current_sha256"], note=f"result={result}")
     provenance.record_physical_git(slug, repo_state, session=session_id, source_ref="checkpoint")
     if publish:
-        publish_checkpoint(slug, label, result)
+        publish_checkpoint(slug, label, result, session_id)
     return cp_id, version
 
 
-def publish_checkpoint(slug, label, result):
+def publish_checkpoint(slug, label, result, session_id=None):
     """Post-commit side effects (master index, optional memory-root git commit, optional handoff bridge).
     Slow (git, Drive folder) and non-canonical, so finish runs them after releasing the session lock."""
     core.rebuild_master_index()
@@ -265,6 +270,12 @@ def publish_checkpoint(slug, label, result):
         handoff.after_checkpoint(slug)
     except (Exception, SystemExit):
         print("HANDOFF_SYNC=FAILED RETRY=aimem_handoff_--retry-pending")
+    # Optional verified Drive mirror publish (atomic, remote readback); a Drive failure never undoes local persistence.
+    try:
+        from . import drive
+        drive.after_checkpoint(slug, session_id)
+    except (Exception, SystemExit):
+        print("DRIVE_SYNC=FAILED RETRY=aimem_drive_push")
 
 
 def finish(slug, session=None, result="", label=None, summary="", allow_unchanged=False,
@@ -276,9 +287,14 @@ def finish(slug, session=None, result="", label=None, summary="", allow_unchange
     with core.project_session_lock(slug):
         cp_id, version, lbl = _finish_locked(slug, session, result, label, summary, allow_unchanged, no_advance_current,
                                              expect_version, acknowledge_newer, allow_secret_pattern)
-    publish_checkpoint(slug, lbl, result)
+    publish_checkpoint(slug, lbl, result, session or _last_finished_session(slug, cp_id))
     indexmod.reindex(slug, quiet=True, best_effort=True)  # derived: never fails a committed finish
     return cp_id, version
+
+
+def _last_finished_session(slug, cp_id):
+    meta = try_load_json(project_dir(slug) / "checkpoints" / cp_id / "meta.json", {}) or {}
+    return meta.get("session_id")
 
 
 def _finish_locked(slug, session, result, label, summary, allow_unchanged, no_advance_current, expect_version,

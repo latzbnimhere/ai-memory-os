@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'lib'))
-from aimem import core, handoff as h
+from aimem import core, driveid, handoff as h
 
 class BridgeTests(unittest.TestCase):
     def setUp(self):
@@ -21,6 +21,13 @@ class BridgeTests(unittest.TestCase):
         self.patch = mock.patch.multiple(core,ROOT=self.root,LOCKS=self.root/'.locks',PROJECTS=self.root/'projects',
             REGISTRY=self.root/'registry'/'projects.json',CONFIG=self.root/'config.json',DB=self.root/'registry'/'memory.db',
             OBJECTS=self.root/'objects',RUN=self.root/'.run'); self.patch.start()
+        # Simulated DriveFS ids: one server id per folder object (inode stands in for the server object).
+        self.ids = {}; self.ids_readable = True
+        def fake_item_id(path):
+            path = Path(path)
+            if not self.ids_readable or not path.exists(): return None
+            return self.ids.setdefault((str(path), os.stat(path).st_ino), 'F%020d' % (len(self.ids) + 1))
+        self.idpatch = mock.patch.object(driveid, 'item_id', fake_item_id); self.idpatch.start()
         self.drive = self.tmp/'CloudStorage/GoogleDrive-test/My Drive/AI-Project-Handoffs'
         self.drive.mkdir(parents=True)
         (self.drive/'00-MASTER').mkdir()
@@ -37,7 +44,7 @@ class BridgeTests(unittest.TestCase):
             (p/'project.json').write_text(h.dumps(dict(slug=slug,current_checkpoint='cp1',memory_version=1,repo='')))
         h.atomic(h.cfg_path(),h.dumps(c))
     def tearDown(self):
-        self.patch.stop(); shutil.rmtree(self.tmp)
+        self.idpatch.stop(); self.patch.stop(); shutil.rmtree(self.tmp)
     def result(self,pid='Alpha'):return h.read_bundle(self.drive/pid)
     def state(self,pid='Alpha'):
         p=h.resolve(h.config(),pid); _,m,_=h.metadata(p)
@@ -104,6 +111,26 @@ class BridgeTests(unittest.TestCase):
     def test_root_identity_pin(self):
         old=self.drive.with_name('Old');self.drive.rename(old);self.drive.mkdir()
         self.assertEqual(h.publish('Alpha')['reason'],'DRIVE_IDENTITY_MISMATCH')
+    def test_identity_is_drive_ids_never_device_numbers(self):
+        c = h.config()
+        self.assertEqual(c['drive']['identity_scheme'], driveid.SCHEME)
+        self.assertNotIn('identity', c['drive']); self.assertNotIn('my_drive_identity', c['drive'])
+        # a remount/reboot changes st_dev; stale device fields left in an old registry are ignored entirely
+        c['drive']['identity'] = {'device': 1, 'inode': 2}; h.atomic(h.cfg_path(), h.dumps(c))
+        self.assertEqual(h.publish('Alpha')['handoff_sync'], 'SYNCED_LOCAL')
+        self.ids_readable = False
+        self.assertEqual(h.publish('Alpha')['reason'], 'DRIVE_IDENTITY_UNVERIFIABLE')
+        self.ids_readable = True
+    def test_legacy_pin_requires_explicit_repin(self):
+        c = h.config(); d = c['drive']
+        c['drive'] = {'path': d['path'], 'identity': {'device': 1, 'inode': 2}}; h.atomic(h.cfg_path(), h.dumps(c))
+        self.assertEqual(h.publish('Alpha')['reason'], 'DRIVE_IDENTITY_UNVERIFIABLE')
+        self.assertEqual(h.pin_drive()['item_id'], d['item_id'])
+        self.assertNotIn('identity', h.config()['drive'])
+        self.assertEqual(h.publish('Alpha')['handoff_sync'], 'SYNCED_LOCAL')
+        old = self.drive.with_name('Old'); self.drive.rename(old); self.drive.mkdir()
+        with self.assertRaises(h.BridgeError) as e: h.pin_drive()
+        self.assertEqual(e.exception.code, 'DRIVE_PIN_REFUSED_ID_CHANGED')
     def test_duplicate_discovery(self):
         (self.tmp/'CloudStorage/GoogleDrive-other/My Drive/AI-Project-Handoffs').mkdir(parents=True)
         with self.assertRaises(h.BridgeError):h.discover(self.tmp/'CloudStorage')

@@ -81,9 +81,16 @@ def main(argv=None):
 
             changed += 1
         atomic_write_json(state_path, state)
+    drive_retry = []
+    try:  # retry pending verified Drive mirror publications; conflicts are never retried automatically
+        from . import drive
+        drive_retry = drive.sweep_retry()
+    except (Exception, SystemExit):
+        drive_retry = ["DRIVE_RETRY_FAILED"]
     try:
         core.RUN.mkdir(exist_ok=True)
-        atomic_write_json(core.RUN / "sweep-state.json", {"time": iso(), "changed_projects": changed, "leases": lease_summary, "version": core.VERSION})
+        atomic_write_json(core.RUN / "sweep-state.json", {"time": iso(), "changed_projects": changed, "leases": lease_summary, "version": core.VERSION,
+                                                           "drive_retry": drive_retry})
     except Exception:
         pass
     print(f"SWEEP=PASS changed_projects={changed}")

@@ -15,7 +15,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from . import core
+from . import core, driveid
 
 LAW = ('CONTEXT/NAVIGATION ONLY. Never authorization for mutation; never a replacement '
        'for sealed evidence, database/repo physical state, or local AI Memory; '
@@ -74,18 +74,17 @@ def atomic(path, text):
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
 
-def ident(path):
-    st = path.stat()
-    return {'device': st.st_dev, 'inode': st.st_ino}
+# Drive identity is the stable drivefs-item-id-v1 scheme (see driveid.py): Google account + server-assigned Drive file
+# ids of My Drive and AI-Project-Handoffs. st_dev/st_ino change on every DriveFS remount or Mac reboot and are never used.
 
 def discover(cloud_storage=None):
-    base = Path(cloud_storage or Path.home() / 'Library/CloudStorage')
+    base = Path(cloud_storage or driveid.cloudstorage_dir())
     candidates = sorted(p for p in base.glob('GoogleDrive-*/My Drive/AI-Project-Handoffs')
                         if p.is_dir() and not p.is_symlink())
     if len(candidates) != 1:
         raise BridgeError('DRIVE_MISSING' if not candidates else 'DRIVE_AMBIGUOUS')
     p = candidates[0]
-    return {'path': str(p), 'identity': ident(p), 'my_drive_identity': ident(p.parent)}
+    return {'path': str(p), **driveid.identity(p)}
 
 def scan(text):
     # Reject, never redact-and-publish. No credential file is opened to build a denylist.
@@ -142,11 +141,30 @@ def drive(c):
     expected = c['drive']
     p = Path(expected['path'])
     if not p.is_dir(): raise BridgeError('DRIVE_MISSING')
-    if (p.is_symlink() or p.parent.name != 'My Drive' or not p.parent.parent.name.startswith('GoogleDrive-')
-            or p.name != 'AI-Project-Handoffs' or ident(p) != expected['identity']
-            or ident(p.parent) != expected['my_drive_identity']):
+    if p.parent.name != 'My Drive' or not p.parent.parent.name.startswith('GoogleDrive-'):
         raise BridgeError('DRIVE_IDENTITY_MISMATCH')
-    return p
+    try:
+        return driveid.check_folder(p, expected, name='AI-Project-Handoffs')
+    except driveid.DriveIdentityError as e:
+        raise BridgeError(e.code) from None
+
+
+def pin_drive():
+    """Explicit operator re-pin to the stable scheme. The discovered folder must be at the registered path; if the
+    registry already carries Drive ids they must be unchanged. The pin never stores st_dev/st_ino."""
+    with core.lock('handoff-global'):
+        c = config()
+        old = c['drive']
+        now = discover(Path(old['path']).parent.parent.parent if old.get('path') else None)
+        if now['path'] != old.get('path'):
+            raise BridgeError('DRIVE_PIN_REFUSED_PATH')
+        if not (now['account'] and now['item_id'] and now['my_drive_item_id']):
+            raise BridgeError('DRIVE_IDENTITY_UNVERIFIABLE')
+        if old.get('identity_scheme') == driveid.SCHEME and any(now[k] != old.get(k) for k in ('account', 'item_id', 'my_drive_item_id')):
+            raise BridgeError('DRIVE_PIN_REFUSED_ID_CHANGED')
+        c['drive'] = {**now, 'pinned_at_utc': utc()}
+        atomic(cfg_path(), dumps(c))
+        return c['drive']
 
 def target(root, folder):
     p = root / folder
@@ -454,6 +472,8 @@ def cli(a):
                          'states':[read_json(f) for f in sorted((d/'status').glob('*.json'))], 'cloud_sync':'UNVERIFIED'})); return
         if a.register:
             register(a.register,a.memory_slug,a.folder); print('REGISTERED='+a.register); return
+        if getattr(a, 'pin_drive', False):
+            d = pin_drive(); print('DRIVE_PINNED scheme=' + d['identity_scheme'] + ' item_id=' + d['item_id']); return
         c = config()
         if a.set_state:
             p = resolve(c,a.project or detect(str(Path.cwd())))
@@ -482,5 +502,6 @@ def add_parser(sp):
     g.add_argument('--all',action='store_true'); g.add_argument('--status',action='store_true')
     g.add_argument('--retry-pending',action='store_true'); g.add_argument('--register')
     g.add_argument('--set-state',metavar='JSON_FILE')
+    g.add_argument('--pin-drive',action='store_true',help='re-pin the Drive root to the stable drivefs-item-id-v1 identity (same path only)')
     p.add_argument('--project'); p.add_argument('--memory-slug'); p.add_argument('--folder')
     p.set_defaults(func=cli)

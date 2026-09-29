@@ -624,6 +624,8 @@ def build_parser():
     p = sp.add_parser("stress"); p.add_argument("--sessions", type=int, default=10); p.add_argument("--steps", type=int, default=20); p.add_argument("--keep", action="store_true"); p.set_defaults(func=cmd_stress)
     from . import handoff
     handoff.add_parser(sp)
+    from . import drive
+    drive.add_parser(sp)
     return ap
 
 

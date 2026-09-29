@@ -34,3 +34,10 @@ Every command that takes a project slug refuses unknown or unsafe slugs (exit 2)
 | `aimem integrate <slug> --instructions` / `aimem integrate-global [--dry-run]` | repo pointer / global managed instruction blocks |
 | `aimem selftest [--full] [--keep] [-v]` / `aimem stress [--sessions N --steps N]` | isolated end-to-end tests |
 | `aimem gc [--days N]` / `aimem-detect [dir]` / `aimem-sweep` | housekeeping / detection (exit 1 unregistered, 6 when one repo is registered under several slugs) / passive physical journal |
+
+## Google Drive mirror (R1)
+
+`aimem drive pin | register <slug> | status <slug> | push <slug> | pull <slug> | verify <slug> | reconcile <slug> [--apply] | attach <slug> --file F --kind evidence|artifact | lease <slug>`.
+Verified, conflict-protected mirror of local memory in `My Drive/AI-Memory/<slug>/` (local memory stays authoritative).
+`begin` prints `DRIVE_STATE=`, `finish` prints `DRIVE_SYNC=` for registered projects. See DRIVE_MIRROR_R1.md and
+DRIVE_AGENT_INSTRUCTIONS.md. `aimem handoff --pin-drive` re-pins the handoff bridge to the stable Drive-id identity.

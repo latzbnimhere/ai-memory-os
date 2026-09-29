@@ -288,6 +288,7 @@ def run(deep=False, check_repo=True, repair=False, slug_filter=None):
             errors.append(f"LaunchAgent plist unreadable: {e}")
     else:
         info.append("LaunchAgent not installed (optional)")
+    _drive_checks(errors, warnings, info)
     if repair:
         for slug in slugs:
             for rid, action in txn.repair(slug):
@@ -310,6 +311,40 @@ def run(deep=False, check_repo=True, repair=False, slug_filter=None):
             if after == index.DB_OK:
                 errors = [e for e in errors if not e.startswith("memory.db")]
     return errors, warnings, info
+
+
+def _drive_checks(errors, warnings, info):
+    """Local-only guard for the Drive layers (no Drive access): identity must be drivefs-item-id-v1, never st_dev/st_ino,
+    and an engine upgrade must not silently drop the Drive mirror or reintroduce device-number identity."""
+    hreg = ROOT / "registry" / "handoffs.json"
+    if hreg.exists():
+        d = (core.try_load_json(hreg, {}) or {}).get("drive") or {}
+        if d.get("identity_scheme") != "drivefs-item-id-v1" or "identity" in d or "my_drive_identity" in d:
+            errors.append("handoff bridge: Drive pin uses legacy device/inode identity (breaks on every remount/reboot); "
+                          "run: aimem handoff --pin-drive")
+    try:
+        from . import driveid, handoff
+        import inspect
+        if ".st_dev" in inspect.getsource(handoff) or ".st_dev" in inspect.getsource(driveid):
+            errors.append("engine regression: Drive identity code references st_dev (device numbers change on remount)")
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"engine regression: Drive identity module unavailable ({type(e).__name__})")
+    mreg = ROOT / "registry" / "drive-mirror.json"
+    if mreg.exists():
+        try:
+            from . import drive
+            reg = drive.load_reg()
+            info.append(f"drive mirror: {len([s for s, e in reg['projects'].items() if e.get('enabled', True)])} project(s), "
+                        f"root item {reg['root'].get('item_id')}")
+            for f in sorted((ROOT / ".drive" / "pending").glob("*.json")):
+                j = core.try_load_json(f, {}) or {}
+                warnings.append(f"drive mirror: pending publication {j.get('slug')} ({j.get('why')}); "
+                                f"run: aimem drive reconcile {j.get('slug')}")
+        except ImportError:
+            errors.append("engine regression: registry/drive-mirror.json exists but the engine has no drive module "
+                          "(an upgrade dropped the Drive mirror)")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"drive mirror registry invalid: {getattr(e, 'code', type(e).__name__)}")
 
 
 def print_report(errors, warnings, info):
