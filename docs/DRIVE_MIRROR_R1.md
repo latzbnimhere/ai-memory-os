@@ -30,6 +30,12 @@ My Drive/AI-Memory/
     INBOX/                  proposals from agents without the CLI; quarantined out-of-protocol edits
 ```
 
+Legacy handoff prompts (`PROMPTS/legacy_handoff__*`) are imported with a bounded listing: top-level files of the
+project's handoff-bridge folder plus files directly inside first-level folders explicitly allowed by glob patterns in
+`settings.legacy_prompt_dirs` (default: none; set it in the local registry, e.g. `["CONTINUATION_*"]`). `ARCHIVE*` folders, deeper levels and symlinked folders are never entered; at most
+`settings.legacy_prompt_max_files` (default 40, hard ceiling 100) files are taken, and a truncation note is recorded
+when the cap is hit. Generated names longer than 150 characters are shortened with a stable hash.
+
 Large binary evidence is never uploaded by default: indexes carry hashes, sizes and local paths. `aimem drive attach`
 uploads one file to a `cold/` folder explicitly (size-capped, secret-scanned when textual).
 
@@ -101,7 +107,8 @@ failure never undoes the local checkpoint. Projects not registered with `aimem d
 `aimem doctor` fails if a Drive registry pins device/inode identity or an upgrade dropped the Drive modules.
 
 Settings (`registry/drive-mirror.json` `settings`): `cloud_ack_timeout_s` 300, `finish_ack_timeout_s` 120,
-`sweep_ack_timeout_s` 60, `lease_ttl_s` 1800, `begin_check` true, `finish_publish` true, `handoff_context_tokens` 6000.
+`sweep_ack_timeout_s` 60, `lease_ttl_s` 1800, `begin_check` true, `finish_publish` true, `handoff_context_tokens` 6000,
+`legacy_prompt_dirs` [] (explicit local allow-list), `legacy_prompt_max_files` 40.
 
 ## Security
 

@@ -47,7 +47,10 @@ JOURNALS = ("DECISIONS.jsonl", "EVENTS.jsonl")
 SUBDIRS = ("PROMPTS", "CHECKPOINTS", "EVIDENCE_INDEX", "ARTIFACT_INDEX", "VERSIONS", "INBOX")
 DEFAULTS = {"cloud_ack_timeout_s": 300, "finish_ack_timeout_s": 120, "sweep_ack_timeout_s": 60,
             "lease_ttl_s": 1800, "begin_check": True, "finish_publish": True, "handoff_context_tokens": 6000,
-            "max_prompt_bytes": 200_000, "max_attach_bytes": 100 * 1024 * 1024}
+            "max_prompt_bytes": 200_000, "max_attach_bytes": 100 * 1024 * 1024,
+            "legacy_prompt_dirs": [], "legacy_prompt_max_files": 40}
+LEGACY_HARD_MAX_FILES = 100
+MAX_MIRROR_NAME = 150
 LAW = ("MIRROR/COORDINATION ONLY. Local AI Memory (LOCAL_MEMORY_ROOT on the owner's Mac) is authoritative; freshly "
        "verified physical repo/runtime state overrides this mirror and local memory. Never mutation authority, never a "
        "replacement for sealed evidence, never permission to continue an irreversible phase.")
@@ -361,6 +364,41 @@ def _evidence_steps(events, limit=80):
     return out[-limit:]
 
 
+def legacy_files(hdir, allowed_dirs=(), max_files=40):
+    """Bounded listing of a legacy handoff folder: top-level files plus files directly inside explicitly allowed
+    first-level folders. Never recurses below the first level, never enters ARCHIVE* (even if a pattern matches) or
+    symlinked folders, and stops at a hard file-count cap. Returns (sorted paths, truncated flag)."""
+    import fnmatch
+    cap = max(0, min(int(max_files), LEGACY_HARD_MAX_FILES))
+    found = []
+
+    def visible(x):
+        return not x.name.startswith(".")
+    for entry in sorted(hdir.iterdir()):
+        if not visible(entry) or entry.is_symlink():
+            continue
+        if entry.is_file():
+            found.append(entry)
+        elif entry.is_dir() and not entry.name.casefold().startswith("archive") \
+                and any(fnmatch.fnmatchcase(entry.name, pat) for pat in allowed_dirs):
+            found.extend(x for x in sorted(entry.iterdir()) if visible(x) and not x.is_symlink() and x.is_file())
+        if len(found) > cap:
+            break
+    found = sorted(found)
+    return found[:cap], len(found) > cap
+
+
+def mirror_name(prefix, rel):
+    """Flat mirror file name for a relative path; names over MAX_MIRROR_NAME are shortened with a stable hash."""
+    name = prefix + rel.replace("/", "__")
+    if len(name) <= MAX_MIRROR_NAME:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    ext = (dot + ext) if dot and len(ext) <= 8 and stem else ""
+    digest = hashlib.sha256(rel.encode()).hexdigest()[:16]
+    return name[:MAX_MIRROR_NAME - len(ext) - 18] + "__" + digest + ext
+
+
 def _prompt_sources(slug, settings):
     """Continuation prompts/instructions: local projects/<slug>/prompts/ plus text files of the legacy handoff folder.
     Google Docs pointers (.gdoc) are referenced by doc id, never copied. Returns ({name: bytes}, [refs])."""
@@ -378,8 +416,13 @@ def _prompt_sources(slug, settings):
         if pe:
             hroot = handoff.drive(c)
             hdir = hroot / pe["folder"]
-            for f in sorted(hdir.rglob("*")):
-                if not f.is_file() or f.name.startswith(".") or f.name in handoff.NAMES:
+            listed, truncated = legacy_files(hdir, settings.get("legacy_prompt_dirs") or (),
+                                             settings.get("legacy_prompt_max_files", 40))
+            if truncated:
+                refs.append({"title": "legacy handoff listing truncated", "source": "legacy-handoff:" + pe["folder"],
+                             "rule": f"hard cap {min(int(settings.get('legacy_prompt_max_files', 40)), LEGACY_HARD_MAX_FILES)} files"})
+            for f in listed:
+                if f.name in handoff.NAMES:
                     continue
                 rel = f.relative_to(hdir).as_posix()
                 if f.suffix.lower() == ".gdoc":
@@ -389,7 +432,7 @@ def _prompt_sources(slug, settings):
                                      "url": f"https://docs.google.com/document/d/{j['doc_id']}",
                                      "source": "legacy-handoff:" + pe["folder"]})
                 elif f.suffix.lower() in (".md", ".txt") and f.stat().st_size <= cap:
-                    files["legacy_handoff__" + rel.replace("/", "__")] = f.read_bytes()
+                    files[mirror_name("legacy_handoff__", rel)] = f.read_bytes()
             for n in handoff.NAMES:
                 if (hdir / n).is_file():
                     refs.append({"title": "bridge " + n, "path": f"AI-Project-Handoffs/{pe['folder']}/{n}",

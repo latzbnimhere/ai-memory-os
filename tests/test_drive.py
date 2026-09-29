@@ -358,6 +358,78 @@ class DriveMirrorTests(unittest.TestCase):
         self.assertEqual(core.sha256_file(self.pdir / "CURRENT.md"), core.sha256_file(self.p / "CURRENT.md"))
         self.assertEqual(drive.compare("dummy", self.manifest()), "MATCH")
 
+    def make_legacy(self, top=5):
+        h = self.tmp / "legacy" / "Legacy"
+        h.mkdir(parents=True)
+        for i in range(top):
+            (h / f"NOTE_{i:03d}.md").write_text(f"note {i}\n")
+        (h / "CHATGPT_HANDOFF.md").write_text("bridge render\n")
+        (h / "START.gdoc").write_text(json.dumps({"doc_id": "1ExampleGoogleDocId000000000000000000000000"}))
+        cont = h / "CONTINUATION_20000101_0000"
+        cont.mkdir()
+        (cont / "CONT.md").write_text("continuation\n")
+        (cont / ("L" * 200 + ".txt")).write_text("long name\n")
+        (cont / "nested").mkdir()
+        (cont / "nested" / "DEEP.md").write_text("too deep\n")
+        deep = h / "ARCHIVE" / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        for i in range(300):
+            (deep / f"EVIDENCE_{i}.md").write_text("archived\n")
+        (h / "ARCHIVE" / "TOP_ARCHIVED.md").write_text("archived\n")
+        (h / "archive-2026").mkdir()
+        (h / "archive-2026" / "X.md").write_text("archived\n")
+        (h / "CONTINUATION_ARCHIVE").mkdir()
+        (h / "Other").mkdir()
+        (h / "Other" / "O.md").write_text("not allowed\n")
+        (h / "CONTINUATION_LINK").symlink_to(h / "Other")
+        return h
+
+    def test_legacy_import_never_enters_archive_and_is_bounded(self):
+        h = self.make_legacy()
+        os.chmod(h / "ARCHIVE", 0)  # any attempt to list it would raise PermissionError
+        try:
+            listed, truncated = drive.legacy_files(h, ["CONTINUATION_*"])
+        finally:
+            os.chmod(h / "ARCHIVE", 0o755)
+        rels = [p.relative_to(h).as_posix() for p in listed]
+        self.assertEqual(drive.legacy_files(h)[0], [p for p in listed if p.parent == h], "no folder unless allowed")
+        self.assertFalse(truncated)
+        self.assertFalse([r for r in rels if "archive" in r.casefold() or r.startswith("Other") or "LINK" in r or "nested" in r])
+        self.assertIn("CONTINUATION_20000101_0000/CONT.md", rels)
+        self.assertIn("START.gdoc", rels)
+        self.assertEqual(rels, sorted(rels))
+        big = self.tmp / "big"
+        big.mkdir()
+        for i in range(250):
+            (big / f"F{i:03d}.md").write_text("x\n")
+        listed, truncated = drive.legacy_files(big, max_files=40)
+        self.assertEqual((len(listed), truncated), (40, True))
+        listed, truncated = drive.legacy_files(big, max_files=10_000)
+        self.assertEqual((len(listed), truncated), (drive.LEGACY_HARD_MAX_FILES, True))
+
+    def test_mirror_name_is_short_stable_and_unchanged_when_short(self):
+        self.assertEqual(drive.mirror_name("legacy_handoff__", "CHECK_PROTOCOL.md"), "legacy_handoff__CHECK_PROTOCOL.md")
+        self.assertEqual(drive.mirror_name("legacy_handoff__", "D/x.md"), "legacy_handoff__D__x.md")
+        long_a, long_b = "A/" + "x" * 300 + ".txt", "A/" + "x" * 299 + "y.txt"
+        na, nb = drive.mirror_name("legacy_handoff__", long_a), drive.mirror_name("legacy_handoff__", long_b)
+        self.assertLessEqual(len(na), drive.MAX_MIRROR_NAME)
+        self.assertTrue(na.endswith(".txt"))
+        self.assertEqual(na, drive.mirror_name("legacy_handoff__", long_a))
+        self.assertNotEqual(na, nb)
+
+    def test_prompt_sources_end_to_end_bounded(self):
+        from aimem import handoff
+        h = self.make_legacy(top=60)
+        cfg = {"projects": [{"memory_slug": "dummy", "folder": "Legacy", "project_id": "Legacy"}]}
+        with mock.patch.object(handoff, "config", return_value=cfg), \
+                mock.patch.object(handoff, "drive", return_value=h.parent):
+            files, refs = drive._prompt_sources("dummy", {**drive.load_reg()["settings"], "legacy_prompt_dirs": ["CONTINUATION_*"]})
+        self.assertFalse([n for n in files if "archive" in n.casefold() or "EVIDENCE" in n or "O.md" in n])
+        self.assertLessEqual(len(files) + len([r for r in refs if r.get("google_doc_id")]), 40)
+        self.assertTrue(all(len(n) <= drive.MAX_MIRROR_NAME for n in files))
+        self.assertTrue(any(r.get("title") == "legacy handoff listing truncated" for r in refs))
+        self.assertTrue(any(r.get("title") == "bridge CHATGPT_HANDOFF.md" for r in refs))
+
     def test_unregistered_project_is_noop(self):
         quiet(cli.main, ["register", "other", "--name", "Other"])
         state, out = quiet(sessions.begin, "other", "claude", "x")
