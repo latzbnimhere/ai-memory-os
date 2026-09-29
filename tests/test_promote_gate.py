@@ -85,6 +85,29 @@ class TestPromotionReviewFindings(TestZeroOpenSessionGate):
         pr2 = promote.Promotion(self.root, live=False, backup_dir=self.tmp / "backups", smoke_slug="gate")
         pr2.smoke_slug_gate()
 
+    def test_drive_layer_gate(self):
+        from unittest import mock
+        p = self.promotion()
+        p.drive_layer_gate()  # root without Drive layers: nothing to preserve
+        (self.root / "registry" / "drive-mirror.json").write_text("{}")
+        (self.root / "registry" / "handoffs.json").write_text(json.dumps({"drive": {"identity_scheme": "drivefs-item-id-v1"}}))
+        p.drive_layer_gate()  # this source carries drive.py/driveid.py and no device-number identity
+        self.assertEqual(p.report["gates"]["DRIVE_LAYER_PRESERVED"]["result"], "PASS")
+        old = self.tmp / "old-source"
+        shutil.copytree(REPO / "lib", old / "lib", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        (old / "lib" / "aimem" / "drive.py").unlink()
+        before = sorted(str(x.relative_to(self.root)) for x in self.root.rglob("*"))
+        with mock.patch.object(promote, "DEV", old):
+            with self.assertRaises(RuntimeError):
+                p.drive_layer_gate()
+        self.assertEqual(p.report["gates"]["DRIVE_LAYER_PRESERVED"]["result"], "FAIL")
+        (old / "lib" / "aimem" / "drive.py").write_text((REPO / "lib" / "aimem" / "drive.py").read_text())
+        (old / "lib" / "aimem" / "handoff.py").write_text("def ident(p):\n    return p.stat().st_dev\n")
+        with mock.patch.object(promote, "DEV", old):
+            with self.assertRaises(RuntimeError):
+                p.drive_layer_gate()
+        self.assertEqual(before, sorted(str(x.relative_to(self.root)) for x in self.root.rglob("*")), "gate never mutates")
+
     def test_newer_target_root_is_refused_before_install(self):
         (self.root / "VERSION").write_text("9.9.9\n")
         before = self.tree_fingerprint()

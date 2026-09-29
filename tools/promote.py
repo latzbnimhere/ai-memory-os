@@ -5,7 +5,8 @@
   python3 tools/promote.py --live --root /path/to/AI-Memory --confirm-live-root /path/to/AI-Memory --backup-dir D
 
 Gates (all must pass before any live mutation): zero OPEN sessions on the target root (checked at preflight, before
-the backup and again immediately before the first mutation), unit tests on an isolated root, full isolated selftest,
+the backup and again immediately before the first mutation), Drive layers preserved (a root using the Drive mirror or
+the stable Drive-id handoff pin refuses a source without them), unit tests on an isolated root, full isolated selftest,
 baseline doctor --deep on the target root, fresh verified backup of the target root. After install: migrate,
 doctor --deep, health, hash verification, functional smoke (begin/step/finish on --smoke-slug, default ai-memory). Any failure after
 the first mutation -> rollback to the preserved pre-promotion files; a failure before it leaves the root untouched.
@@ -105,10 +106,32 @@ class Promotion:
         rc, out = run([sys.executable, str(DEV / "bin" / "aimem"), "migrate", "--dry-run"], env=self.env)
         self.gate("NEW_ENGINE_MIGRATE_PRECHECK", rc == 0 and "MIGRATE=DRY_RUN" in out, out)
 
+    def drive_layer_gate(self):
+        """install() replaces lib/ wholesale; that is how the 4.2.0 promotion silently reverted the stable Drive identity.
+        A target that uses the Drive layers (verified mirror registry, or a handoff pin on the drivefs-item-id-v1
+        scheme) is never promoted to a source that lacks them or reintroduces device-number identity."""
+        aimem_src = DEV / "lib" / "aimem"
+        uses_mirror = (self.root / "registry" / "drive-mirror.json").exists()
+        scheme = None
+        hreg = self.root / "registry" / "handoffs.json"
+        if hreg.exists():
+            try:
+                scheme = (json.loads(hreg.read_text()).get("drive") or {}).get("identity_scheme") or "LEGACY"
+            except (OSError, ValueError):
+                scheme = "UNREADABLE"
+        needed = (["drive.py", "driveid.py"] if uses_mirror else []) + (["driveid.py"] if scheme == "drivefs-item-id-v1" else [])
+        missing = [n for n in dict.fromkeys(needed) if not (aimem_src / n).is_file()]
+        regress = any(".st_dev" in (aimem_src / n).read_text(errors="ignore")
+                      for n in ("handoff.py", "driveid.py", "drive.py") if (aimem_src / n).is_file())
+        ok = not missing and scheme != "UNREADABLE" and not ((uses_mirror or scheme) and regress)
+        self.gate("DRIVE_LAYER_PRESERVED", ok,
+                  f"uses_mirror={uses_mirror} handoff_scheme={scheme} missing_in_source={missing} st_dev_identity={regress}")
+
     # ------------------------------------------------------------ gates
     def pre_gates(self):
         self.zero_open_sessions_gate("ZERO_OPEN_SESSIONS_PREFLIGHT")
         self.smoke_slug_gate()
+        self.drive_layer_gate()
         self.migrate_precheck_gate()
         # unit tests get their own empty memory root so no test can ever resolve to the target root
         unit_root = Path(tempfile.mkdtemp(prefix="aimem-promote-unit-root-"))
