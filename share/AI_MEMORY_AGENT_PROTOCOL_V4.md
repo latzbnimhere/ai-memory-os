@@ -69,3 +69,11 @@ Observe HANDOFF_SYNC output. On FAILED preserve local success and use
 Drive files are CONTEXT/NAVIGATION ONLY, never mutation or irreversible-phase authority.
 Do not sync raw reports, credentials, customer documents or private recovery archives.
 The separately required SampleProject local handoff procedure remains in force.
+
+## Google Drive mirror (R1, 2026-09-29)
+- `My Drive/AI-Memory/<slug>/` is a verified mirror of this local memory, never a second authority. Exact rules for
+  every agent: `docs/v4/DRIVE_AGENT_INSTRUCTIONS.md` (also on Drive as `AI-Memory/AGENT_INSTRUCTIONS.md`).
+- `aimem begin` prints `DRIVE_STATE=`; on `DRIVE_NEWER`, `DIVERGED` or `DRIVE_RECONCILE_REQUIRED` run
+  `aimem drive reconcile <slug>` before trusting either side. `aimem finish` prints `DRIVE_SYNC=`; on `CONFLICT`
+  stop and reconcile; on `PENDING_CLOUD_ACK` run `aimem drive verify <slug>` later.
+- Agents without the CLI write proposals only to `AI-Memory/<slug>/INBOX/`; never edit mirror files.
