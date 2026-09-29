@@ -71,6 +71,15 @@ for `aimem drive push` / the sweep LaunchAgent. Files changed on Drive outside t
 `INBOX/QUARANTINE_*` before being replaced, never silently lost. Journals and indexes are replaced whole; old versions
 remain in `VERSIONS/`.
 
+## What is published (source mode)
+
+`--source auto` (default): the live canonical CURRENT/NEXT, unless ANOTHER active session holds uncheckpointed edits
+in progress; then the accepted (immutable) current checkpoint is published, the manifest records
+`source.mode=checkpoint` and the note `UNCHECKPOINTED_LOCAL_EDITS_NOT_PUBLISHED`, and that session's own `finish`
+publishes its accepted result. `--source canonical|checkpoint` forces one. Comparison states: `MATCH`,
+`MATCH_ACCEPTED_CHECKPOINT` (Drive equals the accepted checkpoint; local has edits in progress), `LOCAL_NEWER`,
+`DRIVE_NEWER`, `DIVERGED`, `UNPUBLISHED`.
+
 ## Commands
 
 | Command | Effect |

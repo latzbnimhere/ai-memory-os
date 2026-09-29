@@ -13,6 +13,8 @@ second memory. Fresh physical repo/runtime state overrides both.
    - Different (a publish is in progress), or a file's SHA-256 differs from `files.<name>.sha256` when you can hash:
      read the same names from `AI-Memory/<slug>/<current_version_dir>/` instead. That folder is complete and immutable.
 3. Read `NEXT.md`, then only the sections of `CURRENT.md` the task needs (search it; it can be very large).
+   `SOURCE_MODE: checkpoint` in LATEST_HANDOFF.md means another agent was mid-session: the mirror shows the last
+   accepted checkpoint and newer work is still in progress locally.
 4. Do NOT load `CHECKPOINTS/`, `VERSIONS/`, `EVIDENCE_INDEX/`, `ARTIFACT_INDEX/`, `DECISIONS.jsonl` or `EVENTS.jsonl`
    wholesale. Open one named file only when a task requires it (e.g. `EVIDENCE_INDEX/INDEX.json` for recent test results).
 5. Everything is REPORTED until verified on the real repo/runtime. If physical state differs from the mirror, physical

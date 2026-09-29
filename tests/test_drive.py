@@ -342,6 +342,22 @@ class DriveMirrorTests(unittest.TestCase):
         self.assertEqual(self.manifest()["generation"], "tampered")
         _ = printed
 
+    def test_active_session_edits_publish_accepted_checkpoint(self):
+        drive.push("dummy")
+        other, _ = quiet(sessions.begin, "dummy", "codex", "long running work")
+        accepted = core.sha256_file(self.p / "CURRENT.md")
+        (self.p / "CURRENT.md").write_text("# half-done edit by the active codex session\n")
+        r = drive.push("dummy", agent="claude", session="SOMEONE-ELSE")
+        self.assertIn(r["status"], ("VERIFIED", "UP_TO_DATE"))
+        self.assertTrue(any(n.startswith("UNCHECKPOINTED_LOCAL_EDITS_NOT_PUBLISHED") for n in r["notes"]))
+        self.assertEqual(core.sha256_file(self.pdir / "CURRENT.md"), accepted)
+        self.assertEqual(drive.compare("dummy", self.manifest()), "MATCH_ACCEPTED_CHECKPOINT")
+        self.assertEqual(drive.verify("dummy")["LOCAL_MATCH"], "YES")
+        quiet(sessions.finish, "dummy", session=other["id"], result="PASS", label="codex done")
+        self.assertEqual(self.manifest()["source"]["mode"], "canonical")
+        self.assertEqual(core.sha256_file(self.pdir / "CURRENT.md"), core.sha256_file(self.p / "CURRENT.md"))
+        self.assertEqual(drive.compare("dummy", self.manifest()), "MATCH")
+
     def test_unregistered_project_is_noop(self):
         quiet(cli.main, ["register", "other", "--name", "Other"])
         state, out = quiet(sessions.begin, "other", "claude", "x")

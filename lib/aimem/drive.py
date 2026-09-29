@@ -457,8 +457,28 @@ def _handoff_section(slug):
         return ""
 
 
-def snapshot(slug, reg, version, generation, backfill=0):
-    """Consistent copy of local canonical memory into a private staging dir. Returns (stage, info)."""
+def resolve_mode(slug, mode="auto", session=None):
+    """auto: live canonical CURRENT/NEXT, unless ANOTHER active session has uncheckpointed edits in progress — then the
+    accepted (immutable) current checkpoint is published and the pending edits are flagged, never mirrored half-done."""
+    if mode in ("canonical", "checkpoint"):
+        return mode, []
+    from . import sessions
+    p = core.project_dir(slug)
+    meta = _checkpoint_meta(p, core.project_manifest(slug).get("current_checkpoint")) or {}
+    nxt = core.sha256_file(p / "NEXT.md") if (p / "NEXT.md").exists() else sha256_bytes(b"")
+    if not meta or (core.sha256_file(p / "CURRENT.md") == meta.get("current_sha256")
+                    and nxt == (meta.get("next_sha256") or sha256_bytes(b""))):
+        return "canonical", []
+    others = [j.get("id") for _f, j in sessions.open_sessions(slug)
+              if j.get("id") != session and sessions.lease_state(j) == "ACTIVE"]
+    if others:
+        return "checkpoint", [f"UNCHECKPOINTED_LOCAL_EDITS_NOT_PUBLISHED active_session={','.join(others)}"]
+    return "canonical", []
+
+
+def snapshot(slug, reg, version, generation, backfill=0, mode="canonical"):
+    """Consistent copy of local memory into a private staging dir. Returns (stage, info).
+    mode canonical: live CURRENT/NEXT; mode checkpoint: the current checkpoint's sealed CURRENT/NEXT."""
     from . import context as ctxmod, reconcile
     p = core.project_dir(slug)
     settings = reg["settings"]
@@ -477,8 +497,18 @@ def snapshot(slug, reg, version, generation, backfill=0):
 
     with core.project_write_lock(slug):
         man = core.project_manifest(slug)
-        cur_b = (p / "CURRENT.md").read_bytes()
-        nxt_b = (p / "NEXT.md").read_bytes() if (p / "NEXT.md").exists() else b""
+        live_cur = (p / "CURRENT.md").read_bytes()
+        live_nxt = (p / "NEXT.md").read_bytes() if (p / "NEXT.md").exists() else b""
+        cur_b, nxt_b = live_cur, live_nxt
+        if mode == "checkpoint":
+            cpd0 = p / "checkpoints" / str(man.get("current_checkpoint"))
+            m0 = _checkpoint_meta(p, man.get("current_checkpoint")) or {}
+            if not m0 or not (cpd0 / "CURRENT.md").is_file():
+                raise DriveError("NO_ACCEPTED_CHECKPOINT", "checkpoint mode needs a current checkpoint")
+            cur_b = (cpd0 / "CURRENT.md").read_bytes()
+            nxt_b = (cpd0 / "NEXT.md").read_bytes() if (cpd0 / "NEXT.md").is_file() else b""
+            if sha256_bytes(cur_b) != m0.get("current_sha256"):
+                raise DriveError("CHECKPOINT_INTEGRITY_FAILED", str(man.get("current_checkpoint")))
         put("CURRENT.md", cur_b, "hot")
         put("NEXT.md", nxt_b, "hot")
         for j in JOURNALS:
@@ -532,7 +562,10 @@ def snapshot(slug, reg, version, generation, backfill=0):
               "checkpoint_time": meta.get("time"), "current_sha256": cur_sha, "next_sha256": nxt_sha,
               "canonical_matches_checkpoint": bool(meta) and cur_sha == meta.get("current_sha256")
               and (not meta.get("next_sha256") or nxt_sha == meta.get("next_sha256")),
-              "checkpoint_integrity": cp_integrity, "engine_version": core.VERSION,
+              "checkpoint_integrity": cp_integrity, "engine_version": core.VERSION, "mode": mode,
+              "live_current_sha256": sha256_bytes(live_cur), "live_next_sha256": sha256_bytes(live_nxt),
+              "uncheckpointed_local_edits": (sha256_bytes(live_cur), sha256_bytes(live_nxt)) != (cur_sha, nxt_sha)
+              or (bool(meta) and cur_sha != meta.get("current_sha256")),
               "local_memory_path": str(p), "last_writer_session": man_after.get("last_writer_session")}
     physical = {k: live.get(k) for k in ("configured", "path", "exists", "is_git_repo", "branch", "head", "tree", "dirty",
                                         "captured_at")}
@@ -569,7 +602,9 @@ def snapshot(slug, reg, version, generation, backfill=0):
         f"SOURCE_MEMORY_VERSION: {source['memory_version']}",
         f"CHECKPOINT: {cp_id} result={source['checkpoint_result']} time={source['checkpoint_time']}",
         f"CURRENT_SHA256: {cur_sha}", f"NEXT_SHA256: {nxt_sha}",
-        f"CANONICAL_MATCHES_CHECKPOINT: {'YES' if source['canonical_matches_checkpoint'] else 'NO (uncheckpointed local edits)'}",
+        f"SOURCE_MODE: {mode}" + (" (accepted checkpoint; another active session has uncheckpointed edits in progress)"
+                                  if mode == "checkpoint" else " (live canonical CURRENT/NEXT)"),
+        f"PUBLISHED_MATCHES_CHECKPOINT: {'YES' if source['canonical_matches_checkpoint'] else 'NO (uncheckpointed local edits)'}",
         f"PHYSICAL_AT_PUBLISH: head={physical.get('head')} branch={physical.get('branch')} dirty={physical.get('dirty')} "
         f"captured_at={physical.get('captured_at')}",
         f"RECONCILIATION_AT_PUBLISH: {rec['status']}" + (f" flags={','.join(rec['flags'])}" if rec["flags"] else ""), "",
@@ -643,7 +678,7 @@ def _files_ok_on_mount(pdir, stage, rels):
 
 
 def push(slug, agent="unknown", session=None, timeout=None, wait=True, allow_secret=False, backfill=0, reason="manual",
-         out=print):
+         out=print, mode="auto"):
     reg = load_reg()
     settings = reg["settings"]
     timeout = settings["cloud_ack_timeout_s"] if timeout is None else timeout
@@ -668,7 +703,9 @@ def push(slug, agent="unknown", session=None, timeout=None, wait=True, allow_sec
         stage = None
         committed = False
         try:
-            stage, info = snapshot(slug, reg, version, generation, backfill)
+            mode, mnotes = resolve_mode(slug, mode, session)
+            notes += mnotes
+            stage, info = snapshot(slug, reg, version, generation, backfill, mode)
             src = info["source"]
             if src["memory_version"] != pre_source["memory_version"]:
                 notes += classify(remote, remote_sha, st, src, reg["writer_root_id"])
@@ -744,8 +781,13 @@ def push(slug, agent="unknown", session=None, timeout=None, wait=True, allow_sec
             if not cur_lease or cur_lease.get("lease_id") != lease["lease_id"]:
                 raise DriveError("LEASE_LOST", "another writer took the lease; nothing committed", core.EXIT_CONFLICT)
             p = core.project_dir(slug)
-            if core.sha256_file(p / "CURRENT.md") != src["current_sha256"] or \
-                    (core.sha256_file(p / "NEXT.md") if (p / "NEXT.md").exists() else sha256_bytes(b"")) != src["next_sha256"]:
+            man_now = core.project_manifest(slug)
+            changed = (int(man_now.get("memory_version", 0)) != src["memory_version"]
+                       or man_now.get("current_checkpoint") != src["current_checkpoint"])
+            if mode == "canonical":
+                changed = changed or core.sha256_file(p / "CURRENT.md") != src["current_sha256"] or \
+                    (core.sha256_file(p / "NEXT.md") if (p / "NEXT.md").exists() else sha256_bytes(b"")) != src["next_sha256"]
+            if changed:
                 _mark_pending(slug, "LOCAL_CHANGED_DURING_PUSH", version, reason)
                 raise DriveError("LOCAL_CHANGED_DURING_PUSH", "local CURRENT/NEXT changed; retry", core.EXIT_WARN)
             # 7. commit marker
@@ -864,6 +906,12 @@ def compare(slug, remote):
     nxt = core.sha256_file(p / "NEXT.md") if (p / "NEXT.md").exists() else sha256_bytes(b"")
     if rs.get("current_sha256") == cur and rs.get("next_sha256") == nxt and rv == lv:
         return "MATCH"
+    if rv == lv and rs.get("current_checkpoint") == man.get("current_checkpoint"):
+        # Drive holds exactly the accepted checkpoint; local only has uncheckpointed edits in progress.
+        meta = _checkpoint_meta(p, man.get("current_checkpoint")) or {}
+        if meta and rs.get("current_sha256") == meta.get("current_sha256") \
+                and rs.get("next_sha256") == (meta.get("next_sha256") or sha256_bytes(b"")):
+            return "MATCH_ACCEPTED_CHECKPOINT"
     if rv > lv:
         return "DRIVE_NEWER"
     if rv == lv and rs.get("current_checkpoint") != man.get("current_checkpoint"):
@@ -952,7 +1000,8 @@ def verify(slug, timeout=None):
         r["MANIFEST_DRIVE_ID"] = (ack["files"].get(prefix + MANIFEST) or {}).get("drive_id")
         cmp = compare(slug, remote)
         r["LOCAL_COMPARE"] = cmp
-        r["LOCAL_MATCH"] = "YES" if cmp == "MATCH" else "NO"
+        r["LOCAL_MATCH"] = "YES" if cmp in ("MATCH", "MATCH_ACCEPTED_CHECKPOINT") else "NO"
+        r["SOURCE_MODE"] = (remote.get("source") or {}).get("mode", "canonical")
         st = load_state(slug) or {}
         if st.get("manifest_sha256") == rsha and all(r[k] == "PASS" for k in ("MOUNT_READBACK", "REMOTE_READBACK", "DRIVE_IDS_STABLE")):
             st.update(status="VERIFIED", verified_at=iso(), manifest_drive_id=r["MANIFEST_DRIVE_ID"])
@@ -1029,7 +1078,7 @@ def reconcile_cmd(slug, apply=False, agent="unknown", session=None):
     else:
         phys = "PHYSICAL_OVERRIDES_DRIVE"
     known = bool(remote and st.get("manifest_sha256") == rsha)
-    if remote and not known and cmp != "MATCH":
+    if remote and not known:
         try:
             classify(remote, rsha, st, {"memory_version": int(core.project_manifest(slug).get("memory_version", 0)),
                                         "current_checkpoint": core.project_manifest(slug).get("current_checkpoint")},
@@ -1042,7 +1091,7 @@ def reconcile_cmd(slug, apply=False, agent="unknown", session=None):
     if unknown:
         action = f"MANUAL_RECONCILIATION ({unknown}: the remote manifest is not the one this root last committed; " \
                  "aimem drive pull, compare with physical state; never auto-merge)"
-    elif cmp == "MATCH":
+    elif cmp in ("MATCH", "MATCH_ACCEPTED_CHECKPOINT"):
         action = "NONE" if known and st.get("status") == "VERIFIED" else "VERIFY"
     elif cmp in ("LOCAL_NEWER", "UNPUBLISHED"):
         action = "PUSH"
@@ -1281,7 +1330,7 @@ def cli(a):
             return
         if act == "push":
             r = push(a.slug, agent=a.agent, session=a.session, timeout=a.timeout, wait=not a.no_wait,
-                     allow_secret=a.allow_secret_pattern, backfill=a.backfill_checkpoints, reason="manual")
+                     allow_secret=a.allow_secret_pattern, backfill=a.backfill_checkpoints, reason="manual", mode=a.source)
             _print(r)
             print(f"DRIVE_SYNC={r['status']} DRIVE_VERSION={r.get('version')}")
             if r["status"] not in ("VERIFIED", "UP_TO_DATE"):
@@ -1337,6 +1386,8 @@ def add_parser(sp):
     q.add_argument("--timeout", type=float); q.add_argument("--no-wait", action="store_true")
     q.add_argument("--allow-secret-pattern", action="store_true", help="verified false positive only")
     q.add_argument("--backfill-checkpoints", type=int, default=0, metavar="N", help="also mirror the N most recent checkpoints")
+    q.add_argument("--source", choices=["auto", "canonical", "checkpoint"], default="auto",
+                   help="auto: live CURRENT/NEXT unless another active session has uncheckpointed edits")
     q = d.add_parser("verify"); q.add_argument("slug"); q.add_argument("--timeout", type=float)
     q = d.add_parser("reconcile"); q.add_argument("slug"); q.add_argument("--apply", action="store_true")
     q.add_argument("--agent", default="unknown"); q.add_argument("--session")
