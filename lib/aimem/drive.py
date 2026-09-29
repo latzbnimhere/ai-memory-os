@@ -45,7 +45,7 @@ LEASE = "LEASE.json"
 HOT = ("CURRENT.md", "NEXT.md", "LATEST_HANDOFF.md", "LATEST_CHECKPOINT.json")
 JOURNALS = ("DECISIONS.jsonl", "EVENTS.jsonl")
 SUBDIRS = ("PROMPTS", "CHECKPOINTS", "EVIDENCE_INDEX", "ARTIFACT_INDEX", "VERSIONS", "INBOX")
-DEFAULTS = {"cloud_ack_timeout_s": 180, "finish_ack_timeout_s": 120, "sweep_ack_timeout_s": 60,
+DEFAULTS = {"cloud_ack_timeout_s": 300, "finish_ack_timeout_s": 120, "sweep_ack_timeout_s": 60,
             "lease_ttl_s": 1800, "begin_check": True, "finish_publish": True, "handoff_context_tokens": 6000,
             "max_prompt_bytes": 200_000, "max_attach_bytes": 100 * 1024 * 1024}
 LAW = ("MIRROR/COORDINATION ONLY. Local AI Memory (LOCAL_MEMORY_ROOT on the owner's Mac) is authoritative; freshly "
@@ -542,12 +542,12 @@ def snapshot(slug, reg, version, generation, backfill=0):
                                          "mirrored_dir": f"CHECKPOINTS/{cp_id}/" if cp_id in mirrored else None}), "hot")
     put("CHECKPOINTS/INDEX.jsonl", "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in index_rows), "index")
     put("EVIDENCE_INDEX/INDEX.json", dumps({
-        "schema": SCHEMA, "slug": slug, "generated_at": iso(), "latest_facts": _latest_facts(slug),
+        "schema": SCHEMA, "slug": slug, "latest_facts": _latest_facts(slug),
         "recent_evidence_steps": _evidence_steps(events), "full_provenance": "EVIDENCE_INDEX/PROVENANCE.jsonl",
         "cold_rule": "Large evidence stays local (paths/hashes here) or in EVIDENCE_INDEX/cold/ via aimem drive attach."}), "index")
     attachments = (load_state(slug) or {}).get("attachments", [])
     put("ARTIFACT_INDEX/INDEX.json", dumps({
-        "schema": SCHEMA, "slug": slug, "generated_at": iso(), "artifact_count": len(artifacts),
+        "schema": SCHEMA, "slug": slug, "artifact_count": len(artifacts),
         "artifact_total_bytes": sum(int(a.get("bytes") or 0) for a in artifacts if isinstance(a, dict)),
         "recent_artifacts": [{k: a.get(k) for k in ("name", "kind", "sha256", "bytes", "source_path", "note", "session_id")}
                              for a in artifacts[-40:] if isinstance(a, dict)],
@@ -673,6 +673,8 @@ def push(slug, agent="unknown", session=None, timeout=None, wait=True, allow_sec
             if src["memory_version"] != pre_source["memory_version"]:
                 notes += classify(remote, remote_sha, st, src, reg["writer_root_id"])
             files = info["files"]
+            skey = f"{src['memory_version']}:{src['current_sha256']}:{src['next_sha256']}"
+            generation = _reuse_pending_version(slug, pdir, stage, files, base_version, skey) or generation
             scan_stage(stage, files, allow_secret)
             rsrc = (remote or {}).get("source") or {}
             if remote and st and st.get("status") == "VERIFIED" and st.get("manifest_sha256") == remote_sha \
@@ -685,8 +687,11 @@ def push(slug, agent="unknown", session=None, timeout=None, wait=True, allow_sec
             for n in HOT:
                 shutil.copyfile(stage / n, stage / vdir / n)
                 files[f"{vdir}/{n}"] = {**files[n], "role": "version"}
+            prev_vj = core.try_load_json(pdir / vdir / "VERSION.json", {}) or {}
             vjson = dumps({"schema": SCHEMA, "slug": slug, "version": version, "generation": generation,
-                           "parent_version": base_version, "created_at": iso(), "source": src,
+                           "parent_version": base_version,
+                           "created_at": prev_vj.get("created_at") if prev_vj.get("generation") == generation else iso(),
+                           "source": src,
                            "files": {n: {k: files[n][k] for k in ("sha256", "md5", "bytes")} for n in HOT}}).encode()
             (stage / vdir / "VERSION.json").write_bytes(vjson)
             files[f"{vdir}/VERSION.json"] = {"role": "version", "sha256": sha256_bytes(vjson),
@@ -714,13 +719,15 @@ def push(slug, agent="unknown", session=None, timeout=None, wait=True, allow_sec
                 raise DriveError("MOUNT_READBACK_FAILED", ", ".join(bad[:5]))
             # 5. remote readback of every content file (written or already present)
             if not wait:
-                _mark_pending(slug, "CONTENT_WRITTEN_NOT_COMMITTED", version, reason)
+                _mark_pending(slug, "CONTENT_WRITTEN_NOT_COMMITTED", version, reason,
+                              {"generation": generation, "vdir": vdir, "base_version": base_version, "source_key": skey})
                 release_lease(pdir, lease, base_version)
                 return {"status": "PENDING_CLOUD_ACK", "version": base_version, "notes": notes, "written": len(written)}
             ack = driveid.wait_cloud_ack(reg["root"]["item_id"], root, [pdir / r for r in files], timeout=timeout,
                                          scratch=work())
             if ack["status"] != "ACK":
-                _mark_pending(slug, "CONTENT_UNACKED", version, reason)
+                _mark_pending(slug, "CONTENT_UNACKED", version, reason,
+                              {"generation": generation, "vdir": vdir, "base_version": base_version, "source_key": skey})
                 unacked = [k for k, v in ack.get("files", {}).items() if v.get("status") != "ACK"][:5]
                 release_lease(pdir, lease, base_version)
                 return {"status": "PENDING_CLOUD_ACK", "version": base_version, "notes": notes,
@@ -790,9 +797,30 @@ def push(slug, agent="unknown", session=None, timeout=None, wait=True, allow_sec
                 shutil.rmtree(stage, ignore_errors=True)
 
 
-def _mark_pending(slug, why, version, reason):
+def _mark_pending(slug, why, version, reason, extra=None):
     core.atomic_write_json(pending_path(slug), {"slug": slug, "why": why, "attempted_version": version,
-                                                "reason": reason, "time": iso()})
+                                                "reason": reason, "time": iso(), **(extra or {})})
+
+
+def _reuse_pending_version(slug, pdir, stage, files, base_version, skey):
+    """A previous attempt already uploaded a complete, uncommitted VERSIONS/<dir> for the same parent and the same
+    local source: reuse its generation and hot files, so a slow Drive converges instead of re-uploading forever."""
+    pend = core.try_load_json(pending_path(slug), {}) or {}
+    if not (pend.get("generation") and pend.get("base_version") == base_version and pend.get("source_key") == skey):
+        return None
+    vdir = pdir / str(pend.get("vdir") or "")
+    vj = core.try_load_json(vdir / "VERSION.json", None) if pend.get("vdir") else None
+    if not isinstance(vj, dict) or vj.get("generation") != pend["generation"] or vj.get("version") != base_version + 1:
+        return None
+    for n in HOT:
+        ent = (vj.get("files") or {}).get(n) or {}
+        if not (vdir / n).is_file() or sha256_path(vdir / n) != ent.get("sha256"):
+            return None
+    for n in HOT:
+        data = (vdir / n).read_bytes()
+        (stage / n).write_bytes(data)
+        files[n] = {**files[n], "sha256": sha256_bytes(data), "md5": hashlib.md5(data).hexdigest(), "bytes": len(data)}
+    return pend["generation"]
 
 
 def _write_root_index(reg, root):

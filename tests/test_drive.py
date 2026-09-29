@@ -169,8 +169,17 @@ class DriveMirrorTests(unittest.TestCase):
         self.assertEqual((self.pdir / "MANIFEST.json").read_bytes(), m1, "previous version stays current")
         self.assertTrue(drive.pending_path("dummy").exists())
         self.assertFalse(drive.lease_live(drive.read_lease(self.pdir)), "lease released")
+        pend = json.loads(drive.pending_path("dummy").read_text())
+        vdir = self.pdir / pend["vdir"]
+        self.assertTrue((vdir / "LATEST_HANDOFF.md").is_file())
+        handoff_bytes = (vdir / "LATEST_HANDOFF.md").read_bytes()
+        self.assertEqual(drive.push("dummy")["status"], "PENDING_CLOUD_ACK")
+        self.assertEqual(json.loads(drive.pending_path("dummy").read_text())["generation"], pend["generation"],
+                         "an unchanged local source reuses the uploaded, uncommitted version")
         self.fake.server_down = False
         self.assertEqual(drive.sweep_retry(), ["dummy:VERIFIED"])
+        self.assertEqual(self.manifest()["generation"], pend["generation"])
+        self.assertEqual((self.pdir / "LATEST_HANDOFF.md").read_bytes(), handoff_bytes)
         self.assertEqual(self.manifest()["version"], 2)
         self.assertFalse(drive.pending_path("dummy").exists())
 

@@ -91,7 +91,7 @@ Engine hooks: `aimem begin` prints `DRIVE_STATE=MATCH|LOCAL_NEWER|DRIVE_NEWER|DI
 failure never undoes the local checkpoint. Projects not registered with `aimem drive register` are unaffected.
 `aimem doctor` fails if a Drive registry pins device/inode identity or an upgrade dropped the Drive modules.
 
-Settings (`registry/drive-mirror.json` `settings`): `cloud_ack_timeout_s` 180, `finish_ack_timeout_s` 120,
+Settings (`registry/drive-mirror.json` `settings`): `cloud_ack_timeout_s` 300, `finish_ack_timeout_s` 120,
 `sweep_ack_timeout_s` 60, `lease_ttl_s` 1800, `begin_check` true, `finish_publish` true, `handoff_context_tokens` 6000.
 
 ## Security
